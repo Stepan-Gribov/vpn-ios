@@ -1,0 +1,5 @@
+Native/Recovery/** text eol=lf
+Scripts/*.py text eol=lf
+Scripts/*.sh text eol=lf
+# Unified patches intentionally prefix tabbed/blank context with one space.
+Native/CombinedXray/*.patch -whitespace

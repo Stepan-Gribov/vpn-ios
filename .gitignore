@@ -1,0 +1,25 @@
+.DS_Store
+.derived*/
+.build/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+*.xcresult/
+*.ipa
+*.mobileprovision
+*.p12
+Native/KindlyTurn/build/
+
+# Generated native runtime and geo databases are provided in the full project ZIP.
+Packages/SwiftyXrayKit/Frameworks/LibXray.xcframework/**/LibXray
+Resources/geoip.dat
+Resources/geosite.dat
+
+# Local signed archives, IPA exports, and distribution logs.
+Artifacts/
+
+# Independent local build inputs and settings.
+Resources/panel-bootstrap.json
+*.local.xcconfig
+TnDtun.xcodeproj/
+Packages/SwiftyXrayKit/Frameworks/
