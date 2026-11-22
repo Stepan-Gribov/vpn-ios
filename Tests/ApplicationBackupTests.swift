@@ -248,7 +248,7 @@ final class ApplicationBackupTests: XCTestCase {
     private func fixture() throws -> ApplicationBackup {
         var turn = SimpleConfiguration()
         turn.id = "turn-profile"; turn.callLink = "https://vk.ru/call/join/backup-test"
-        turn.server = "203.0.113.7:56010"; turn.vlessID = "810d5f7e-7a00-4a0c-95cd-7ac733a77816"
+        turn.server = "203.0.113.7:56010"; turn.vlessID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
         turn.wrapKey = String(repeating: "ac", count: 32)
         var dns = SimpleConfiguration(); dns.id = "dns-profile"; dns.mode = .dns
         dns.dns.domain = "tunnel.example.com"; dns.dns.publicKey = String(repeating: "bd", count: 32)

@@ -686,7 +686,7 @@ final class TnDtunUITests: XCTestCase {
         addTURN("203.0.113.99")
         let profile: [String: Any] = ["id": "backup-turn", "mode": "turn",
             "callLink": "https://vk.ru/call/join/backup-ui", "server": "203.0.113.44:443",
-            "vlessID": "810d5f7e-7a00-4a0c-95cd-7ac733a77816", "wrapKey": "", "dns": [:]]
+            "vlessID": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "wrapKey": "", "dns": [:]]
         let dns: [String: Any] = ["id": "backup-dns", "mode": "dns", "callLink": "", "server": "",
             "vlessID": "", "wrapKey": "", "dns": ["domain": "backup.example.com", "publicKey": String(repeating: "ab", count: 32),
                 "resolver": "203.0.113.53:53", "useWiFiResolver": true, "wifiResolver": "8.8.8.8:53", "sessionCount": 8]]
