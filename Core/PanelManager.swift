@@ -7,7 +7,6 @@ enum SubscriptionAddition: Equatable {
     case idle, adding, added, failed(String)
 }
 
-/// Explicit user operations only. No startup, reachability or VPN event calls sync.
 @MainActor
 final class PanelManager: ObservableObject {
     @Published private(set) var subscriptions: [PanelSubscription] = []
@@ -15,6 +14,7 @@ final class PanelManager: ObservableObject {
         didSet { UserDefaults.standard.set(reconnectRecommended, forKey: "panel.routingPending") }
     }
     @Published private(set) var pendingCount = 0
+    @Published private(set) var showsTransferProgress = false
     @Published private(set) var progress = ""
     @Published var error: String?
     @Published private(set) var activationText = ""
@@ -22,12 +22,18 @@ final class PanelManager: ObservableObject {
     @Published private(set) var addition: SubscriptionAddition = .idle
     private let store: SimpleStore
     private let clientOverride: PanelClient?
-    private let activationTrust: PanelTrust?
+    private let activationService: PanelServiceOrigins?
     private weak var runtime: AppStore?
     private weak var vpn: VPNManager?
-    private var tasks: [String: Task<Void, Never>] = [:]
-    private var tail: Task<Void, Never>?
-    private var current: Task<Void, Never>?
+    private var tasks: [String: Task<Bool, Never>] = [:]
+    private var interactiveKeys = Set<String>()
+    private var tail: Task<Bool, Never>?
+    private var current: Task<Bool, Never>?
+    private var foregroundTimer: Task<Void, Never>?
+    private var foregroundActive = false
+    private var memoryRetryAfter: Date?
+    private var runtimeSetup: Task<Void, Never>?
+    private let scheduleBackground: (Date?) -> Void
     private lazy var client: PanelClient = {
         if let clientOverride { return clientOverride }
         let url = store.manualFileURL
@@ -38,8 +44,11 @@ final class PanelManager: ObservableObject {
             await manager?.showTransferProgress(route)
         }), currentManualIDs: { try SimpleStore.manualIDs(at: url) })
     }()
-    init(store: SimpleStore, client: PanelClient? = nil, activationTrust: PanelTrust? = nil) {
-        self.store = store; self.clientOverride = client; self.activationTrust = activationTrust; reload()
+    init(store: SimpleStore, client: PanelClient? = nil, activationService: PanelServiceOrigins? = nil,
+         scheduleBackground: @escaping (Date?) -> Void = { _ in }) {
+        self.store = store; self.clientOverride = client; self.activationService = activationService
+        self.scheduleBackground = scheduleBackground
+        reload()
     }
     private func canReadSystemDNS() -> Bool { vpn?.tunnelIsActive == false }
     private func showTransferProgress(_ route: PanelTransferRoute) {
@@ -47,7 +56,27 @@ final class PanelManager: ObservableObject {
         progress = route.message
     }
     func attach(runtime: AppStore, vpn: VPNManager) { self.runtime = runtime; self.vpn = vpn }
+    func prepareRuntime(_ runtime: AppStore, vpn: VPNManager) async {
+        if let runtimeSetup { await runtimeSetup.value; return }
+        let setup = Task { @MainActor in
+            attach(runtime: runtime, vpn: vpn)
+            runtime.applyPanelDNS(store.applicationDNSServers)
+            await vpn.load()
+            let selected = (vpn.tunnelIsActive ? vpn.connectedProfileID : nil) ?? store.selectedProfileID ??
+                AppGroup.defaults.string(forKey: AppGroup.activeProfileKey)
+            runtime.restoreSelection(store.availableConfigurations, profileID: selected)
+            runtime.applySplitTunneling(store.splitTunneling)
+            runtime.applySplitOptions(amnezia: store.amneziaSplitEnabled, minutes: store.fullTunnelMinutes)
+            runtime.applyAutomation(autoCaptcha: store.autoCaptcha, autoRecovery: store.autoRecovery,
+                                    turnCheckInterval: store.turnCheckInterval)
+        }
+        runtimeSetup = setup
+        await setup.value
+    }
     var busy: Bool { pendingCount > 0 }
+    var lastSuccessfulUpdate: Date? {
+        subscriptions.map(\.lastSync).max().map { Date(timeIntervalSince1970: Double($0)) }
+    }
     func reload() { do { subscriptions = try store.panelVault.snapshot().subscriptions } catch { self.error = error.localizedDescription } }
     func updateActivationText(_ value: String) {
         guard value.utf8.count <= 8192 else { error = "The activation code or link is too long."; return }
@@ -72,22 +101,22 @@ final class PanelManager: ObservableObject {
         guard !busy, addition != .added else { return }
         do {
             let key = try PanelContract.subscriptionKey(activationText)
-            let trust = try activationTrust ?? PanelContract.bundled()
+            let trust = try (activationService ?? PanelContract.bundledService()).primary
             activate(PanelActivation(code: key, trust: trust), name: UIDevice.current.name, reportingAddition: true)
         } catch { addition = .failed(error.localizedDescription) }
     }
     func receive(_ url: URL) {
         guard !busy else { showingSubscription = true; return }
         do {
-            let bundled = try activationTrust ?? PanelContract.bundled()
-            let input = try PanelContract.activation(url.absoluteString, bootstrap: bundled)
-            guard bundled.sameSource(input.trust) else { throw PanelFailure("Use the 4-letter key supplied with your subscription.") }
+            let service = try activationService ?? PanelContract.bundledService()
+            let input = try PanelContract.activation(url.absoluteString, bootstrap: service.primary)
+            guard service.contains(input.trust) else { throw PanelFailure("Use the 4-letter key supplied with your subscription.") }
             activationText = try PanelContract.subscriptionKey(input.code); addition = .idle
         } catch { activationText = ""; addition = .failed("Use the 4-letter key supplied with your subscription.") }
         showingSubscription = true
     }
     func isTrusted(_ trust: PanelTrust) -> Bool {
-        ((try? (activationTrust ?? PanelContract.bundled()).sameSource(trust)) ?? false) || subscriptions.contains { $0.trust.sameSource(trust) }
+        ((try? (activationService ?? PanelContract.bundledService()).contains(trust)) ?? false) || subscriptions.contains { $0.trust.sameSource(trust) }
     }
     func activate(_ input: PanelActivation, name: String, trustConfirmed: Bool = false, reportingAddition: Bool = false) {
         if reportingAddition && busy { return }
@@ -111,9 +140,7 @@ final class PanelManager: ObservableObject {
     }
     func refresh(_ sub: PanelSubscription) {
         guard !sub.needsActivation else { error = "Add this subscription again using its key."; return }
-        enqueue("sync:" + sub.id) { [self] in
-            try await client.sync(sub, baseline: store.panelBaseline, manualIDs: store.manualProfileIDs)
-        }
+        enqueueSync(sub, automatic: false)
     }
     func refreshAll() {
         guard !subscriptions.isEmpty else { showingSubscription = true; return }
@@ -123,25 +150,107 @@ final class PanelManager: ObservableObject {
     func remove(_ sub: PanelSubscription) {
         // Deletion is not a network operation. Its tombstone rejects any response
         // already in flight, including an activation with the same old request.
+        defer { rescheduleAutomaticSync() }
         do { try store.panelVault.transaction { $0.remove(sub.id) }; try store.reloadPanelProjection(); reload(); applyChanges() }
         catch { self.error = error.localizedDescription }
     }
-    private func enqueue(_ key: String, reportingAddition: Bool = false, appliesSettings: Bool = true, operation: @escaping @MainActor () async throws -> Void) {
-        guard tasks[key] == nil else { return }
+
+    func setForegroundActive(_ active: Bool) {
+        foregroundActive = active
+        if active { reload() }
+        rescheduleAutomaticSync()
+    }
+
+    private var nextAutomaticDate: Date? {
+        guard let date = subscriptions.compactMap(\.automaticSyncDate).min() else { return nil }
+        return max(date, memoryRetryAfter ?? date)
+    }
+
+    private func rescheduleAutomaticSync() {
+        foregroundTimer?.cancel()
+        foregroundTimer = nil
+        let next = nextAutomaticDate
+        scheduleBackground(next)
+        guard foregroundActive, !busy, let next else { return }
+        foregroundTimer = Task { @MainActor [weak self] in
+            let delay = max(0, next.timeIntervalSinceNow)
+            do { try await Task.sleep(for: .seconds(delay)) } catch { return }
+            guard let self, !Task.isCancelled, foregroundActive, !busy else { return }
+            if let sub = dueSubscriptions().first { enqueueSync(sub, automatic: true) }
+            else { rescheduleAutomaticSync() }
+        }
+    }
+
+    private func dueSubscriptions(at date: Date = .now) -> [PanelSubscription] {
+        guard nextAutomaticDate.map({ $0 <= date }) == true else { return [] }
+        return subscriptions.compactMap { sub in
+            sub.automaticSyncDate.flatMap { $0 <= date ? (sub, $0) : nil }
+        }.sorted { $0.1 < $1.1 }.map { $0.0 }
+    }
+
+    /// The iOS refresh window can expire while a network operation is running.
+    /// Cancel only the automatic work started by this invocation.
+    func refreshDueSubscriptions() async -> Bool {
+        reload()
+        defer { rescheduleAutomaticSync() }
+        var succeeded = true
+        for id in dueSubscriptions().map(\.id) {
+            guard !Task.isCancelled else { return false }
+            guard !busy else { break }
+            guard let sub = dueSubscriptions().first(where: { $0.id == id }) else { continue }
+            let task = enqueueSync(sub, automatic: true, systemBackground: true)
+            let result = await withTaskCancellationHandler { await task.value } onCancel: { task.cancel() }
+            succeeded = succeeded && result
+        }
+        return succeeded && !Task.isCancelled
+    }
+
+    @discardableResult
+    private func enqueueSync(_ sub: PanelSubscription, automatic: Bool, systemBackground: Bool = false) -> Task<Bool, Never> {
+        enqueue("sync:" + sub.id, automaticSubscription: automatic ? sub : nil, systemBackground: systemBackground) { [self] in
+            try await client.sync(sub, baseline: store.panelBaseline, manualIDs: store.manualProfileIDs)
+        }
+    }
+
+    private func delayAutomaticRetry(_ sub: PanelSubscription) {
+        let retry = Date().addingTimeInterval(15 * 60)
+        do {
+            try store.panelVault.transaction { state in
+                guard let index = state.subscriptions.firstIndex(where: { $0.id == sub.id }),
+                      state.subscriptions[index].lastSync == sub.lastSync,
+                      state.subscriptions[index].automaticSyncDate == sub.automaticSyncDate else { return }
+                state.subscriptions[index].nextSyncAt = Int64(retry.timeIntervalSince1970.rounded(.up))
+            }
+        } catch {
+            memoryRetryAfter = retry
+        }
+    }
+
+    @discardableResult
+    private func enqueue(_ key: String, reportingAddition: Bool = false, appliesSettings: Bool = true,
+                         automaticSubscription: PanelSubscription? = nil, systemBackground: Bool = false,
+                         operation: @escaping @MainActor () async throws -> Void) -> Task<Bool, Never> {
+        if automaticSubscription == nil {
+            interactiveKeys.insert(key)
+            showsTransferProgress = true
+        }
+        if let task = tasks[key] { return task }
         let previous = tail
-        let task = Task { @MainActor [self] in
-            await previous?.value
+        let task = Task { @MainActor [self] () -> Bool in
+            _ = await previous?.value
             defer {
                 tasks.removeValue(forKey: key); pendingCount = tasks.count
+                interactiveKeys.remove(key); showsTransferProgress = !interactiveKeys.isEmpty
                 progress = ""; current = nil
+                if tasks.isEmpty { tail = nil }
                 if reportingAddition && addition == .adding { addition = .idle }
+                rescheduleAutomaticSync()
             }
-            guard !Task.isCancelled else { return }
             current = tasks[key]
-            error = nil
+            if interactiveKeys.contains(key) { error = nil }
             progress = PanelTransferRoute.direct.message
-            let activity = PanelBackgroundActivity { [weak self] in self?.current?.cancel() }
-            defer { activity.finish() }
+            let activity = systemBackground ? nil : PanelBackgroundActivity { [weak self] in self?.tasks[key]?.cancel() }
+            defer { activity?.finish() }
             do {
                 let lease = try store.panelVault.requestLease()
                 // Hold the cross-process lease until native cleanup completes.
@@ -152,14 +261,22 @@ final class PanelManager: ObservableObject {
                 reload()
                 if appliesSettings { applyChanges() }
                 if reportingAddition { addition = .added }
-            } catch is CancellationError { progress = "Cancelled. Saved settings were retained." }
-            catch {
-                if reportingAddition { addition = .failed(Self.additionError(error)) }
-                else { self.error = error.localizedDescription }
-                showingSubscription = true; reload()
+                return true
+            } catch {
+                if let automaticSubscription { delayAutomaticRetry(automaticSubscription) }
+                if error is CancellationError {
+                    progress = "Cancelled. Saved settings were retained."
+                } else if interactiveKeys.contains(key) {
+                    if reportingAddition { addition = .failed(Self.additionError(error)) }
+                    else { self.error = error.localizedDescription }
+                    showingSubscription = true
+                }
+                reload()
+                return false
             }
         }
         tasks[key] = task; pendingCount = tasks.count; tail = task
+        return task
     }
     private static func additionError(_ error: Error) -> String {
         if let http = error as? PanelHTTPFailure {
@@ -233,7 +350,7 @@ extension PanelManager {
     /// Signed, isolated UI-test responses. Synthetic keys never reach a real service.
     static func forUITesting(store: SimpleStore) -> PanelManager {
         let exchange = SubscriptionUIExchange(scenario: ProcessInfo.processInfo.environment["TNDTUN_UI_SUBSCRIPTION"] ?? "invalid")
-        return PanelManager(store: store, client: PanelClient(vault: store.panelVault, exchange: exchange, pause: { _ in }), activationTrust: SubscriptionUIExchange.trust)
+        return PanelManager(store: store, client: PanelClient(vault: store.panelVault, exchange: exchange, pause: { _ in }), activationService: PanelServiceOrigins(primary: SubscriptionUIExchange.trust))
     }
 }
 

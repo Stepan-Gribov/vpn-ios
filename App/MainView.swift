@@ -40,13 +40,26 @@ struct MainView: View {
             HStack(spacing: 12) {
                 Button { panel.showingSubscription = true } label: {
                     Label(panel.subscriptions.isEmpty ? "Add subscription" : "Subscription", systemImage: "person.crop.circle.badge.checkmark")
-                        .frame(maxWidth: .infinity, minHeight: 42)
+                        .lineLimit(1).minimumScaleFactor(0.65)
+                        .frame(maxWidth: .infinity).frame(height: 42)
                 }.accessibilityIdentifier("openSubscription")
                 Button { panel.refreshAll() } label: {
-                    Label("Refresh", systemImage: "arrow.clockwise").frame(maxWidth: .infinity, minHeight: 42)
-                }.accessibilityIdentifier("refreshSubscriptions")
-            }.font(.callout.weight(.medium)).buttonStyle(.bordered).padding(.bottom, 14)
-            if panel.busy { HStack { ProgressView(); Text(panel.progress.isEmpty ? "Updating subscription…" : panel.progress).font(.caption).accessibilityIdentifier("subscriptionTransportStatus"); Spacer(); Button("Cancel") { panel.cancel() } }.padding(.bottom, 12) }
+                    VStack(spacing: 1) {
+                        Label("Refresh", systemImage: "arrow.clockwise")
+                        if let updated = panel.lastSuccessfulUpdate {
+                            Text(updated, format: .dateTime.hour().minute())
+                                .font(.caption2).foregroundStyle(.secondary)
+                        }
+                    }
+                    .lineLimit(1).minimumScaleFactor(0.65)
+                    .frame(maxWidth: .infinity).frame(height: 42)
+                }
+                .accessibilityLabel("Refresh")
+                .accessibilityValue(panel.lastSuccessfulUpdate?.formatted(date: .abbreviated, time: .shortened) ?? "")
+                .accessibilityIdentifier("refreshSubscriptions")
+            }.font(.callout.weight(.medium)).dynamicTypeSize(...DynamicTypeSize.xLarge)
+                .buttonStyle(.bordered).padding(.bottom, 14)
+            if panel.showsTransferProgress { HStack { ProgressView(); Text(panel.progress.isEmpty ? "Updating subscription…" : panel.progress).font(.caption).accessibilityIdentifier("subscriptionTransportStatus"); Spacer(); Button("Cancel") { panel.cancel() } }.padding(.bottom, 12) }
             if panel.reconnectRecommended {
                 Button("Reconnect to apply updated settings") { panel.reconnectToApplySettings() }
                     .font(.caption).padding(.bottom, 12)

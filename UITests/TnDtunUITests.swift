@@ -256,14 +256,27 @@ final class TnDtunUITests: XCTestCase {
     func testSubscriptionAddSuccessAndSavedSubscriptionRefresh() {
         app.terminate(); app.launchEnvironment["TNDTUN_UI_SUBSCRIPTION"] = "success"; app.launch()
         addTURN("203.0.113.15")
+        app.terminate()
+        app.launchArguments = ["--ui-testing", "-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL"]
+        app.launch()
+        let homeRefresh = app.buttons["refreshSubscriptions"]
+        let initialRefreshFrame = homeRefresh.frame
+        let initialCardTop = app.otherElements["connectionStatusCard"].frame.minY
         app.buttons["openSubscription"].tap()
         let input = app.textFields["activationInput"]
         XCTAssertTrue(input.waitForExistence(timeout: 5)); input.tap(); input.typeText("qwrt")
-        let add = app.buttons["activateAccess"]; add.tap()
-        XCTAssertFalse(add.isEnabled); XCTAssertFalse(input.isEnabled)
+        app.buttons["activateAccess"].tap()
         XCTAssertTrue(app.staticTexts["subscriptionAdded"].waitForExistence(timeout: 10))
         capture("subscription-added")
         app.buttons["subscriptionAddedDone"].tap()
+        XCTAssertEqual(homeRefresh.frame, initialRefreshFrame)
+        XCTAssertEqual(app.otherElements["connectionStatusCard"].frame.minY, initialCardTop)
+        let savedUpdate = homeRefresh.value as? String
+        XCTAssertFalse((savedUpdate ?? "").isEmpty)
+        app.terminate()
+        app.launchArguments = ["--ui-testing"]
+        app.launch()
+        XCTAssertEqual(homeRefresh.value as? String, savedUpdate)
         XCTAssertEqual(app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH 'connect_'")).count, 2)
         app.buttons["openSubscription"].tap()
         let refresh = app.buttons["Refresh subscription"]

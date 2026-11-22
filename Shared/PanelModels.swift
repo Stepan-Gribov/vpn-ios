@@ -64,6 +64,12 @@ struct PanelAssignedProfile: Codable, Equatable, CustomStringConvertible {
     }
 }
 
+struct PanelSubscriptionSync: Codable, Equatable {
+    static let allowedMinutes = 15...1440
+    var enabled: Bool
+    var intervalMinutes: Int
+}
+
 struct PanelSettings: Codable, Equatable {
     var autoCaptcha: Bool
     var autoRecovery: Bool
@@ -71,6 +77,7 @@ struct PanelSettings: Codable, Equatable {
     var dnsServers: [String]
     var dnsTunnel: PanelDNS?
     var splitTunneling: SplitTunnelSettings
+    var subscriptionSync: PanelSubscriptionSync? = nil
 }
 
 struct PanelPackage: Codable, Equatable, CustomStringConvertible {
@@ -98,6 +105,14 @@ struct PanelSubscription: Codable, Equatable, Identifiable, CustomStringConverti
     var needsActivation = false
     var subscriptionCode: String? = nil
     var description: String { "PanelSubscription" }
+    var nextSyncAt: Int64? = nil
+    var automaticSyncDate: Date? {
+        guard !needsActivation, package.status == "active",
+              let policy = package.settings?.subscriptionSync, policy.enabled,
+              PanelSubscriptionSync.allowedMinutes.contains(policy.intervalMinutes),
+              let nextSyncAt else { return nil }
+        return Date(timeIntervalSince1970: Double(nextSyncAt))
+    }
     func accessAllowed(now: Int64) -> Bool { package.status == "active" && (package.expiresAt.map { now < $0 } ?? true) }
     func statusText(now: Int64) -> String {
         if package.status == "revoked" { return "Access revoked" }
@@ -138,7 +153,11 @@ struct PanelVaultState: Codable, Equatable {
         if stored.settings == nil { stored.settings = previous?.package.settings }
         if baselineSettings == nil { baselineSettings = baseline }
         subscriptions.removeAll { $0.id == id }
-        subscriptions.append(PanelSubscription(id: id, trust: trust, token: token, package: stored, lastSync: now, subscriptionCode: package.subscriptionCode ?? previous?.subscriptionCode))
+        let policy = package.settings?.subscriptionSync
+        let nextSyncAt = policy.flatMap { $0.enabled ? now + Int64($0.intervalMinutes) * 60 : nil }
+        subscriptions.append(PanelSubscription(id: id, trust: trust, token: token, package: stored, lastSync: now,
+                                               subscriptionCode: package.subscriptionCode ?? previous?.subscriptionCode,
+                                               nextSyncAt: package.status == "active" ? nextSyncAt : nil))
         if activation || previous == nil || activeSettingsOwner == nil || activeSettingsOwner == id {
             activeSettingsOwner = id
             if let settings = package.settings { globalSettings = settings; settingsEpoch = UUID().uuidString }

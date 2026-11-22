@@ -2,6 +2,26 @@ import Foundation
 import CryptoKit
 import Security
 
+/// Only the origins shipped with the app can share this service's credentials.
+struct PanelServiceOrigins: Sendable {
+    let primary: PanelTrust
+    var alternateAPIs: [String] = []
+
+    func contains(_ trust: PanelTrust) -> Bool {
+        primary.keyID == trust.keyID && primary.publicKey == trust.publicKey &&
+            (primary.api == trust.api || alternateAPIs.contains(trust.api))
+    }
+
+    func endpoints(for trust: PanelTrust) -> [PanelTrust] {
+        guard contains(trust) else { return [trust] }
+        return ([primary.api] + alternateAPIs).map { api in
+            var endpoint = trust
+            endpoint.api = api
+            return endpoint
+        }
+    }
+}
+
 enum PanelContract {
     static let envelopeLimit = 12 * 1024 * 1024
     static let payloadLimit = 8 * 1024 * 1024
@@ -61,17 +81,25 @@ enum PanelContract {
               try decode64(key, limit: 32).count == 32 else { throw PanelFailure("Invalid service signing key.") }
         return PanelTrust(api: try self.api(api), keyID: kid, publicKey: key, dns: try validatedDNS(dns))
     }
-    static func bootstrap(_ data: Data) throws -> PanelTrust {
+    static func serviceOrigins(_ data: Data) throws -> PanelServiceOrigins {
         let root = try PanelJSON.parse(data, limit: 16 * 1024)
         guard try root.field("api_version").integer == 1, try root.field("package_schema").integer == 1,
               try root.field("algorithm").text() == "Ed25519" else { throw PanelFailure("The bundled service configuration is unsupported.") }
-        return try trust(api: root.field("api_base").text(2048), kid: root.field("key_id").text(),
+        let primary = try trust(api: root.field("api_base").text(2048), kid: root.field("key_id").text(),
                          key: root.field("public_key").text(), dns: dns(root.field("dns_transport")))
+        let alternates = try root.object["alternate_api_bases"].map { value in
+            try stringList(value, maximum: 4).map { try api($0) }
+        } ?? []
+        let all = [primary.api] + alternates
+        guard Set(all).count == all.count else { throw PanelFailure("Duplicate subscription service address.") }
+        return PanelServiceOrigins(primary: primary, alternateAPIs: alternates)
     }
-    static func bundled() throws -> PanelTrust {
+    private static let installedService = Result {
         guard let url = Bundle.main.url(forResource: "panel-bootstrap", withExtension: "json") else { throw PanelFailure("The bundled panel transport is missing. Reinstall TnDtun.") }
-        return try bootstrap(Data(contentsOf: url))
+        return try serviceOrigins(Data(contentsOf: url))
     }
+    static func bundledService() throws -> PanelServiceOrigins { try installedService.get() }
+    static func bundled() throws -> PanelTrust { try bundledService().primary }
     static func activation(_ raw: String, bootstrap: PanelTrust) throws -> PanelActivation {
         guard raw.utf8.count <= 8192 else { throw PanelFailure("The activation code or link is too long.") }
         let raw = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -148,8 +176,17 @@ enum PanelContract {
             guard Set(try push.object.keys) == ["apple", "google"] else { throw PanelFailure("Invalid push notification settings.") }
             split.pushNotifications = try PushNotificationSettings(apple: push.field("apple").boolean, google: push.field("google").boolean)
         }
+        let subscriptionSync = try value.object["subscriptionSync"].map { policy in
+            guard Set(try policy.object.keys) == ["enabled", "intervalMinutes"],
+                  let minutes = Int(exactly: try policy.field("intervalMinutes").integer),
+                  PanelSubscriptionSync.allowedMinutes.contains(minutes) else {
+                throw PanelFailure("Invalid subscription sync policy.")
+            }
+            return try PanelSubscriptionSync(enabled: policy.field("enabled").boolean, intervalMinutes: minutes)
+        }
         return try PanelSettings(autoCaptcha: value.field("autoCaptcha").boolean, autoRecovery: value.field("autoRecovery").boolean,
-            turnCheckInterval: Int(interval), dnsServers: servers, dnsTunnel: tunnel.isNull ? nil : dns(tunnel), splitTunneling: split)
+            turnCheckInterval: Int(interval), dnsServers: servers, dnsTunnel: tunnel.isNull ? nil : dns(tunnel),
+            splitTunneling: split, subscriptionSync: subscriptionSync)
     }
     static func verify(_ envelope: Data, trust: PanelTrust, nonce: String, deviceID: String,
                        previous: PanelSubscription? = nil) throws -> PanelPackage {

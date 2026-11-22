@@ -9,6 +9,7 @@ private final class PanelFixture: @unchecked Sendable {
     let device = "12345678-1234-1234-1234-123456789012"
     let clientID = "22345678-1234-1234-1234-123456789012"
     var subscriptionCode: String?
+    var subscriptionSync: PanelSubscriptionSync?
     var trust: PanelTrust { PanelTrust(api: "https://panel.example.test/v1", keyID: "0123456789abcdef", publicKey: PanelContract.base64URL(signing.publicKey.rawRepresentation), dns: Self.dns) }
     static let dns = PanelDNS(domain: "dns.example.test", publicKey: String(repeating: "ab", count: 32), resolver: "1.1.1.1:5353", savedResolvers: ["8.8.8.8:53"])
     static var settings: PanelSettings {
@@ -33,6 +34,11 @@ private final class PanelFixture: @unchecked Sendable {
                 "client_id": clientID, "client_name": "Test client", "device_id": device, "status": "active", "expires_at": NSNull(), "sync_after_seconds": 10,
                 "profiles": profiles, "settings": try JSONSerialization.jsonObject(with: JSONEncoder().encode(Self.settings))]
         if let subscriptionCode { result["subscription_code"] = subscriptionCode }
+        if let subscriptionSync {
+            var settings = result["settings"] as! [String: Any]
+            settings["subscriptionSync"] = ["enabled": subscriptionSync.enabled, "intervalMinutes": subscriptionSync.intervalMinutes]
+            result["settings"] = settings
+        }
         return result
     }
     func envelope(_ payload: [String: Any]) throws -> Data {
@@ -63,41 +69,157 @@ private actor PanelStub: PanelExchanging {
         return try JSONSerialization.data(withJSONObject: ["device_id": fixture.device, "token": "test-private-token", "package": JSONSerialization.jsonObject(with: envelope)])
     }
     func setBlock() { block = true }
+    func failNextRequest(_ status: Int) { failures.append(status) }
 }
 
 private actor PanelRouteLog {
     var routes: [PanelTransferRoute] = []
     var requests: [Bool] = []
+    var origins: [String] = []
     func route(_ value: PanelTransferRoute) { routes.append(value) }
-    func request(_ value: Bool) { requests.append(value) }
+    func request(_ api: String, _ viaDNS: Bool) {
+        origins.append(api)
+        requests.append(viaDNS)
+    }
 }
 
 final class PanelTests: XCTestCase {
-    func testPanelRouteUsesDNSOnlyAfterExplicitDirectFailureAndStartsDirectAgain() async throws {
+    func testSubscriptionSyncPolicyIsOptionalAndStrictlyValidatedAfterSignature() throws {
+        let fixture = PanelFixture()
+        XCTAssertNil(try fixture.package().settings?.subscriptionSync)
+        for minutes in [15, 1440] {
+            fixture.subscriptionSync = PanelSubscriptionSync(enabled: true, intervalMinutes: minutes)
+            XCTAssertEqual(try fixture.package().settings?.subscriptionSync, fixture.subscriptionSync)
+        }
+        let invalidPolicies: [[String: Any]] = [
+            ["enabled": true, "intervalMinutes": 14],
+            ["enabled": false, "intervalMinutes": 1441],
+            ["enabled": 1, "intervalMinutes": 30],
+            ["enabled": true, "intervalMinutes": "30"],
+            ["enabled": true],
+        ]
+        for policy in invalidPolicies {
+            var payload = try fixture.payload()
+            var settings = try XCTUnwrap(payload["settings"] as? [String: Any])
+            settings["subscriptionSync"] = policy
+            payload["settings"] = settings
+            XCTAssertThrowsError(try PanelContract.verify(fixture.envelope(payload), trust: fixture.trust,
+                                                          nonce: "nonce", deviceID: fixture.device))
+        }
+    }
+
+    @MainActor func testDueSubscriptionSyncRetriesAndCoalescesWithManualRefresh() async throws {
+        let fixture = PanelFixture(), v = vault()
+        fixture.subscriptionSync = PanelSubscriptionSync(enabled: true, intervalMinutes: 15)
+        let packet = try fixture.package()
+        let now = Int64(Date().timeIntervalSince1970)
+        let otherID = "12345678-1234-1234-1234-123456789099"
+        var otherPayload = try fixture.payload()
+        otherPayload["device_id"] = otherID
+        otherPayload["profiles"] = []
+        let otherPacket = try PanelContract.verify(fixture.envelope(otherPayload),
+            trust: fixture.trust, nonce: "nonce", deviceID: otherID)
+        try v.transaction { state in
+            try state.accept(packet, trust: fixture.trust, token: "test-first", expectedEpoch: 0,
+                activation: true, manualIDs: [], baseline: PanelFixture.settings, now: now - 901)
+            try state.accept(otherPacket, trust: fixture.trust, token: "test-second", expectedEpoch: 0,
+                activation: true, manualIDs: [], baseline: PanelFixture.settings, now: now)
+        }
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let store = SimpleStore(fileURL: dir.appendingPathComponent("profiles.json"),
+                                defaults: UserDefaults(suiteName: UUID().uuidString)!, panelVault: v)
+        let stub = PanelStub(fixture, failures: [500])
+        let client = PanelClient(vault: v, exchange: stub, pause: { _ in })
+        let panel = PanelManager(store: store, client: client)
+
+        let firstResult = await panel.refreshDueSubscriptions()
+        XCTAssertFalse(firstResult)
+        let failed = try XCTUnwrap(v.snapshot().subscriptions.first { $0.package.deviceID == fixture.device })
+        XCTAssertEqual(failed.lastSync, now - 901)
+        XCTAssertGreaterThanOrEqual(try XCTUnwrap(failed.nextSyncAt), now + 900)
+        XCTAssertFalse(panel.showingSubscription)
+        let earlyResult = await panel.refreshDueSubscriptions()
+        XCTAssertTrue(earlyResult)
+        let afterRetryCheck = await stub.requests.map { $0.2 }
+        XCTAssertEqual(afterRetryCheck, ["test-first"])
+
+        panel.refresh(failed)
+        panel.refresh(failed)
+        let catchUp = await panel.refreshDueSubscriptions()
+        XCTAssertTrue(catchUp)
+        let deadline = Date().addingTimeInterval(5)
+        while panel.busy && Date() < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertFalse(panel.busy)
+        let requests = await stub.requests.map { $0.2 }
+        XCTAssertEqual(requests, ["test-first", "test-first"])
+        let saved = try XCTUnwrap(v.snapshot().subscriptions.first { $0.id == failed.id })
+        XCTAssertGreaterThan(saved.lastSync, failed.lastSync)
+        XCTAssertEqual(saved.nextSyncAt, saved.lastSync + 900)
+        XCTAssertEqual(try v.snapshot().subscriptions.first { $0.package.deviceID == otherID }?.lastSync, now)
+
+        try v.transaction { state in
+            let index = try XCTUnwrap(state.subscriptions.firstIndex { $0.id == saved.id })
+            state.subscriptions[index].nextSyncAt = now - 1
+        }
+        panel.setForegroundActive(true)
+        defer { panel.setForegroundActive(false) }
+        let foregroundDeadline = Date().addingTimeInterval(5)
+        while Date() < foregroundDeadline {
+            let count = await stub.requests.count
+            if count == 3 && !panel.busy { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let foregroundRequests = await stub.requests.map { $0.2 }
+        XCTAssertEqual(foregroundRequests, ["test-first", "test-first", "test-first"])
+        XCTAssertEqual(try v.snapshot().subscriptions.first { $0.package.deviceID == otherID }?.lastSync, now)
+    }
+    func testPanelRouteTriesTrustedDirectAddressesThenDNSOnPrimaryAndStartsDirectAgain() async throws {
         let log = PanelRouteLog()
         let unavailable = try PanelJSON.parse(Data(#"{"error":"direct_unavailable"}"#.utf8), limit: 1024)
         let success = try PanelJSON.parse(Data(#"{"status":200,"transport":"direct","body":"e30="}"#.utf8), limit: 1024)
-        _ = try await PanelTransportSequence.run(forceDNS: false, progress: { await log.route($0) }) { viaDNS in
-            await log.request(viaDNS)
+        _ = try await PanelTransportSequence.run(apis: ["primary", "ip", "legacy"], forceDNS: false, progress: { await log.route($0) }) { api, viaDNS in
+            await log.request(api, viaDNS)
             return viaDNS ? success : unavailable
         }
-        _ = try await PanelTransportSequence.run(forceDNS: false, progress: { await log.route($0) }) { viaDNS in
-            await log.request(viaDNS); return success
+        _ = try await PanelTransportSequence.run(apis: ["primary", "ip", "legacy"], forceDNS: false, progress: { await log.route($0) }) { api, viaDNS in
+            await log.request(api, viaDNS); return success
         }
         let routes = await log.routes, requests = await log.requests
         XCTAssertEqual(routes, [.direct, .dns, .direct])
-        XCTAssertEqual(requests, [false, true, false], "A previous DNS success must not pin the next request to DNS")
+        XCTAssertEqual(requests, [false, false, false, true, false])
+        let origins = await log.origins
+        XCTAssertEqual(origins, ["primary", "ip", "legacy", "primary", "primary"])
+    }
+
+    func testPanelRouteTriesNextDirectOnGatewayFailureWithoutStartingDNS() async throws {
+        let log = PanelRouteLog()
+        let result = try await PanelTransportSequence.run(apis: ["primary", "ip", "legacy"], forceDNS: false, progress: { await log.route($0) }) { api, viaDNS in
+            await log.request(api, viaDNS)
+            switch api {
+            case "primary": return .object(["status": .number("502")])
+            case "ip": return .object(["status": .number("504"), "body": .string(Data("Gateway timeout".utf8).base64EncodedString())])
+            default: return .object(["status": .number("200")])
+            }
+        }
+        let routes = await log.routes, origins = await log.origins, requests = await log.requests
+        XCTAssertEqual(routes, [.direct])
+        XCTAssertEqual(origins, ["primary", "ip", "legacy"])
+        XCTAssertEqual(requests, [false, false, false])
+        XCTAssertEqual(result.api, "legacy")
+        XCTAssertEqual(result.reply, .object(["status": .number("200")]))
     }
 
     func testPanelRouteDoesNotFallbackForHTTPOrValidationErrors() async throws {
         let responses = [200, 401, 403, 429, 503, 307, 308].map { #"{"status":\#($0),"transport":"direct","body":"e30="}"# }
+            + [#"{"status":502,"body":"eyJjb2RlIjoicHJvdmlzaW9uaW5nX3BlbmRpbmcifQ=="}"#]
             + ["response_too_large", "invalid_request", "untrusted_manifest", "physical_network_unavailable", "cancelled"].map { #"{"error":"\#($0)"}"# }
         for json in responses {
             let log = PanelRouteLog(), expected = try PanelJSON.parse(Data(json.utf8), limit: 1024)
-            let result = try await PanelTransportSequence.run(forceDNS: false, progress: { await log.route($0) }) { viaDNS in
-                await log.request(viaDNS); return expected
+            let result = try await PanelTransportSequence.run(apis: ["primary", "ip", "legacy"], forceDNS: false, progress: { await log.route($0) }) { api, viaDNS in
+                await log.request(api, viaDNS); return expected
             }
-            XCTAssertEqual(try result.encoded(), try expected.encoded())
+            XCTAssertEqual(result.api, "primary")
+            XCTAssertEqual(result.reply, expected)
             let routes = await log.routes, requests = await log.requests
             XCTAssertEqual(routes, [.direct]); XCTAssertEqual(requests, [false])
         }
@@ -105,23 +227,25 @@ final class PanelTests: XCTestCase {
 
     func testPanelRouteExplicitForceDNSDoesNotSendDirectRequest() async throws {
         let log = PanelRouteLog()
-        _ = try await PanelTransportSequence.run(forceDNS: true, progress: { await log.route($0) }) { viaDNS in
-            await log.request(viaDNS)
+        _ = try await PanelTransportSequence.run(apis: ["primary", "ip", "legacy"], forceDNS: true, progress: { await log.route($0) }) { api, viaDNS in
+            await log.request(api, viaDNS)
             return try PanelJSON.parse(Data(#"{"status":200}"#.utf8), limit: 1024)
         }
         let routes = await log.routes, requests = await log.requests
         XCTAssertEqual(routes, [.dns]); XCTAssertEqual(requests, [true])
+        let origins = await log.origins
+        XCTAssertEqual(origins, ["primary"])
     }
 
     func testPanelRouteCancellationAtEitherPhaseBoundaryDoesNotStartDNS() async throws {
         for cancelAtDNSProgress in [false, true] {
             let log = PanelRouteLog()
             let task = Task {
-                try await PanelTransportSequence.run(forceDNS: false, progress: { route in
+                try await PanelTransportSequence.run(apis: ["primary", "ip", "legacy"], forceDNS: false, progress: { route in
                     await log.route(route)
                     if route == .dns && cancelAtDNSProgress { withUnsafeCurrentTask { $0?.cancel() } }
-                }) { viaDNS in
-                    await log.request(viaDNS)
+                }) { api, viaDNS in
+                    await log.request(api, viaDNS)
                     if !cancelAtDNSProgress { withUnsafeCurrentTask { $0?.cancel() } }
                     return try PanelJSON.parse(Data(#"{"error":"direct_unavailable"}"#.utf8), limit: 1024)
                 }
@@ -130,7 +254,7 @@ final class PanelTests: XCTestCase {
             catch is CancellationError {}
             let routes = await log.routes, requests = await log.requests
             XCTAssertEqual(routes, cancelAtDNSProgress ? [.direct, .dns] : [.direct])
-            XCTAssertEqual(requests, [false])
+            XCTAssertEqual(requests, cancelAtDNSProgress ? [false, false, false] : [false])
         }
     }
 
@@ -268,7 +392,7 @@ final class PanelTests: XCTestCase {
         let v = vault(), stub = PanelStub(PanelFixture())
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let store = SimpleStore(fileURL: dir.appendingPathComponent("profiles.json"), defaults: UserDefaults(suiteName: UUID().uuidString)!, panelVault: v)
-        let panel = PanelManager(store: store, client: PanelClient(vault: v, exchange: stub, pause: { _ in }), activationTrust: stub.fixture.trust)
+        let panel = PanelManager(store: store, client: PanelClient(vault: v, exchange: stub, pause: { _ in }), activationService: PanelServiceOrigins(primary: stub.fixture.trust))
         panel.updateSubscriptionKey("qwr")
         XCTAssertFalse(panel.canAddSubscription)
         panel.updateSubscriptionKey("qwrt")
@@ -301,7 +425,7 @@ final class PanelTests: XCTestCase {
         let stub = PanelStub(PanelFixture(), failures: [400]), v = vault()
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let store = SimpleStore(fileURL: dir.appendingPathComponent("profiles.json"), defaults: UserDefaults(suiteName: UUID().uuidString)!, panelVault: v)
-        let panel = PanelManager(store: store, client: PanelClient(vault: v, exchange: stub, pause: { _ in }), activationTrust: stub.fixture.trust)
+        let panel = PanelManager(store: store, client: PanelClient(vault: v, exchange: stub, pause: { _ in }), activationService: PanelServiceOrigins(primary: stub.fixture.trust))
         panel.updateSubscriptionKey("qwrt"); panel.addSubscription()
         var deadline = Date().addingTimeInterval(5)
         while panel.busy && Date() < deadline { try await Task.sleep(for: .milliseconds(10)) }
@@ -324,6 +448,82 @@ final class PanelTests: XCTestCase {
         XCTAssertTrue(panel.progress.isEmpty)
         XCTAssertTrue(panel.canAddSubscription); XCTAssertNil(panel.error)
         XCTAssertEqual(try v.snapshot(), accepted); XCTAssertEqual(store.configurations, profiles)
+    }
+
+    @MainActor func testOfficialLinksAcceptBothOriginsAndRejectForeignHostsOrPins() throws {
+        let service = PanelServiceOrigins(primary: PanelFixture().trust, alternateAPIs: ["https://backup.example.test/v1"])
+        let store = SimpleStore(fileURL: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString),
+                                defaults: UserDefaults(suiteName: UUID().uuidString)!, panelVault: vault())
+        let manager = PanelManager(store: store, activationService: service)
+        func open(_ api: String, key: String, kid: String) throws {
+            var link = URLComponents(string: "tndtun://activate")!
+            link.queryItems = [URLQueryItem(name: "code", value: "QWRT"), URLQueryItem(name: "api", value: api),
+                               URLQueryItem(name: "kid", value: kid), URLQueryItem(name: "key", value: key)]
+            manager.receive(try XCTUnwrap(link.url))
+        }
+        for api in [service.primary.api] + service.alternateAPIs {
+            try open(api, key: service.primary.publicKey, kid: service.primary.keyID)
+            XCTAssertTrue(manager.canAddSubscription)
+        }
+        for (api, key, kid) in [("https://other.example/v1", service.primary.publicKey, service.primary.keyID),
+                                (service.primary.api, PanelFixture().trust.publicKey, service.primary.keyID),
+                                (service.primary.api, service.primary.publicKey, "0000000000000000")] {
+            try open(api, key: key, kid: kid)
+            XCTAssertFalse(manager.canAddSubscription)
+            XCTAssertTrue(manager.activationText.isEmpty)
+        }
+    }
+
+    func testReactivationByNewOriginKeepsLegacyDeviceOwnerAndProfileGrants() async throws {
+        let fixture = PanelFixture(), store = vault()
+        var old = fixture.trust
+        old.api = "https://old.example.test/v1"
+        let service = PanelServiceOrigins(primary: fixture.trust, alternateAPIs: [old.api])
+        let exchange = PanelStub(fixture)
+        let client = PanelClient(vault: store, exchange: exchange, serviceOverride: service)
+        try await client.activate(PanelActivation(code: "QWRT", trust: old), name: "Phone", baseline: PanelFixture.settings, manualIDs: [])
+        let original = try store.snapshot()
+        let sub = try XCTUnwrap(original.subscriptions.first)
+        let grant = try XCTUnwrap(sub.package.profiles[0].configuration(subscriptionID: sub.id).profile.panelAccess)
+
+        try await client.activate(PanelActivation(code: "QWRT", trust: fixture.trust), name: "Phone", baseline: PanelFixture.settings, manualIDs: [])
+        try await client.sync(sub, baseline: PanelFixture.settings, manualIDs: [])
+        let current = try store.snapshot()
+        XCTAssertEqual(current.subscriptions.map(\.id), [sub.id])
+        XCTAssertEqual(current.subscriptions.first?.token, sub.token)
+        XCTAssertEqual(current.records, original.records)
+        XCTAssertEqual(current.globalSettings, original.globalSettings)
+        XCTAssertEqual(current.activeSettingsOwner, original.activeSettingsOwner)
+        XCTAssertEqual(current.installationID, original.installationID)
+        XCTAssertTrue(try store.permits(grant, now: 1))
+        var foreign = old
+        foreign.api = "https://unrelated.example/v1"
+        XCTAssertEqual(service.endpoints(for: foreign), [foreign])
+        do {
+            try await client.activate(PanelActivation(code: "QWRT", trust: foreign), name: "Phone", baseline: PanelFixture.settings, manualIDs: [])
+            XCTFail("A different source cannot take over the existing profiles")
+        } catch is PanelFailure {}
+        XCTAssertEqual(try store.snapshot(), current)
+    }
+
+    func testDeletedLegacySubscriptionIsNotRecreatedByPendingAliasActivation() async throws {
+        let fixture = PanelFixture(), store = vault()
+        var legacy = fixture.trust
+        legacy.api = "https://old.example.test/v1"
+        let service = PanelServiceOrigins(primary: fixture.trust, alternateAPIs: [legacy.api])
+        let original = PanelClient(vault: store, exchange: PanelStub(fixture), serviceOverride: service)
+        try await original.activate(PanelActivation(code: "QWRT", trust: legacy), name: "Phone", baseline: PanelFixture.settings, manualIDs: [])
+        let id = try XCTUnwrap(store.snapshot().subscriptions.first?.id)
+        let inFlight = PanelClient(vault: store, exchange: PanelStub(fixture, failures: [503]), pause: { _ in
+            try store.transaction { $0.remove(id) }
+        }, serviceOverride: service)
+        do {
+            try await inFlight.activate(PanelActivation(code: "QWRT", trust: fixture.trust), name: "Phone", baseline: PanelFixture.settings, manualIDs: [])
+            XCTFail("The late activation must respect the deletion under the previous address")
+        } catch let error as PanelFailure {
+            XCTAssertTrue(error.message.contains("removed"))
+        }
+        XCTAssertTrue(try store.snapshot().subscriptions.isEmpty)
     }
 
     func testLinksRejectDuplicateUnknownIncompleteAndUntrustedPins() throws {
