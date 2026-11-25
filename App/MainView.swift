@@ -147,9 +147,8 @@ struct MainView: View {
                 }
             }
         }
-        .onValueChange(of: vpn.turnCaptchaRequired) { required in
-            // Native verification and its invisible browser fallback never present a sheet.
-            if !required { showingCaptcha = false }
+        .onValueChange(of: manualVKVerificationAvailable) { available in
+            if !available { showingCaptcha = false }
         }
         .onValueChange(of: vpn.isConnected) { connected in
             if !connected {
@@ -442,7 +441,7 @@ struct MainView: View {
                 if vpn.recoveryFailed {
                     statusAction("Retry", identifier: "retryConnection") { vpn.retryRecovery(using: runtime) }
                 }
-                if vpn.turnCaptchaRequired {
+                if manualVKVerificationAvailable {
                     statusAction("Complete VK verification", identifier: "completeVKVerification") { showingCaptcha = true }
                 }
             }
@@ -455,6 +454,10 @@ struct MainView: View {
         .background(Color(red: 0.96, green: 0.97, blue: 0.985), in: RoundedRectangle(cornerRadius: 22))
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("connectionStatusCard")
+    }
+
+    private var manualVKVerificationAvailable: Bool {
+        vpn.turnCaptchaRequired && !store.autoCaptcha
     }
 
     private func statusAction(_ title: String, identifier: String, action: @escaping () -> Void) -> some View {

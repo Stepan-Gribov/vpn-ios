@@ -379,7 +379,7 @@ final class TnDtunUITests: XCTestCase {
             let statusBar = app.statusBars.firstMatch
             if statusBar.exists { XCTAssertGreaterThanOrEqual(app.buttons["automationSettings"].frame.minY, statusBar.frame.maxY) }
             XCTAssertEqual(app.buttons["completeVKVerification"].exists, state == "captcha",
-                           "A pending challenge must keep a manual action even with automatic verification enabled")
+                           "The manual verification action is available when VK requests input in manual mode")
             XCTAssertFalse(app.staticTexts["Access active"].exists)
             XCTAssertFalse(app.staticTexts["Подписка активна"].exists)
             if state == "disconnected" { XCTAssertEqual(status.label, "Disconnected") }
