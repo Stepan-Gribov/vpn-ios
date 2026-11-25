@@ -393,6 +393,8 @@ final class PanelTests: XCTestCase {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let store = SimpleStore(fileURL: dir.appendingPathComponent("profiles.json"), defaults: UserDefaults(suiteName: UUID().uuidString)!, panelVault: v)
         let panel = PanelManager(store: store, client: PanelClient(vault: v, exchange: stub, pause: { _ in }), activationService: PanelServiceOrigins(primary: stub.fixture.trust))
+        let runtime = AppStore(), vpn = VPNManager()
+        panel.attach(runtime: runtime, vpn: vpn)
         panel.updateSubscriptionKey("qwr")
         XCTAssertFalse(panel.canAddSubscription)
         panel.updateSubscriptionKey("qwrt")
@@ -411,6 +413,15 @@ final class PanelTests: XCTestCase {
         XCTAssertEqual(try PanelJSON.parse(requests[0].1, limit: 16384).field("code").text(), "QWRT")
         let sub = try XCTUnwrap(panel.subscriptions.first)
         let ids = store.configurations.map(\.id)
+        let amnezia = try XCTUnwrap(store.configurations.first { $0.mode == .amnezia })
+        let baseline = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(
+            XrayConfigurationBuilder.build(profile: amnezia.profile, settings: runtime.settings).utf8)) as? [String: Any])
+        let settings = TemporaryFullTunnelPolicy.applying(to: runtime.settings, isTURN: false, isDNS: false, isAmnezia: true, full: false)
+        let root = TunnelConfiguration.applying(to: baseline, settings: settings, isTURN: false)
+        let rules = try XCTUnwrap((root["routing"] as? [String: Any])?["rules"] as? [[String: Any]])
+        XCTAssertEqual(rules.first { ($0["ip"] as? [String])?.contains("203.0.113.0/24") == true }?["outboundTag"] as? String, "proxy")
+        XCTAssertEqual(rules.first { ($0["domain"] as? [String])?.contains("domain:manual.test") == true }?["outboundTag"] as? String, "proxy")
+        store.amneziaSplitEnabled = false
         panel.refresh(sub)
         while panel.busy && Date() < deadline { try await Task.sleep(for: .milliseconds(10)) }
         XCTAssertFalse(panel.busy); XCTAssertNil(panel.error)
@@ -418,6 +429,9 @@ final class PanelTests: XCTestCase {
         XCTAssertEqual(panel.subscriptions.first?.token, sub.token)
         XCTAssertEqual(store.configurations.map(\.id), ids)
         XCTAssertEqual(store.splitTunneling, try PanelFixture.settings.splitTunneling.validated())
+        XCTAssertEqual(runtime.settings.amneziaSplitEnabled, false)
+        let optedOut = TemporaryFullTunnelPolicy.applying(to: runtime.settings, isTURN: false, isDNS: false, isAmnezia: true, full: false)
+        XCTAssertEqual(optedOut.splitTunneling?.mode, .disabled)
         let count = await stub.requests.count; XCTAssertEqual(count, 2)
     }
 

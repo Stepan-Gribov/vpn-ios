@@ -128,8 +128,7 @@ struct MainView: View {
                 try store.restore(backup)
                 runtime.applyPanelDNS(store.applicationDNSServers)
                 runtime.restoreSelection(store.availableConfigurations, profileID: store.selectedProfileID)
-                runtime.applySplitTunneling(store.splitTunneling)
-                runtime.applySplitOptions(amnezia: store.amneziaSplitEnabled, minutes: store.fullTunnelMinutes)
+                runtime.applySplitTunneling(from: store)
                 runtime.applyAutomation(autoCaptcha: store.autoCaptcha, autoRecovery: store.autoRecovery, turnCheckInterval: store.turnCheckInterval, turnSessionCount: store.turnSessionCount)
                 vpn.bind(store: runtime)
             }) { captcha, recovery, autoStart, interval, split, amneziaSplit, fullMinutes, sessions in
@@ -138,8 +137,7 @@ struct MainView: View {
                 store.amneziaSplitEnabled = amneziaSplit; store.fullTunnelMinutes = fullMinutes
                 store.autoConnectOnLaunch = autoStart
                 store.autoCaptcha = captcha; store.autoRecovery = recovery; store.turnCheckInterval = interval; store.turnSessionCount = sessions
-                runtime.applySplitTunneling(split)
-                runtime.applySplitOptions(amnezia: amneziaSplit, minutes: fullMinutes)
+                runtime.applySplitTunneling(from: store)
                 runtime.applyAutomation(autoCaptcha: captcha, autoRecovery: recovery, turnCheckInterval: interval, turnSessionCount: sessions)
                 if routingChanged && vpn.tunnelIsActive && runtime.activeProfile != nil {
                     await vpn.connect(using: runtime)
@@ -345,7 +343,7 @@ struct MainView: View {
                 try await vpn.disconnectForImport()
                 try runtime.clearPreparedConfiguration()
                 try store.restore(backup)
-                runtime.applySplitTunneling(store.splitTunneling)
+                runtime.applySplitTunneling(from: store)
                 runtime.applyAutomation(autoCaptcha: store.autoCaptcha, autoRecovery: store.autoRecovery, turnCheckInterval: store.turnCheckInterval, turnSessionCount: store.turnSessionCount)
                 report("imported", "Profiles: \(store.configurations.count)")
             }
@@ -606,7 +604,7 @@ struct MainView: View {
                     selected = try store.applyingDetectedDNS(to: selected, servers: network.servers, usingWiFi: network.usesWiFi)
                 }
                 runtime.applyAutomation(autoCaptcha: store.autoCaptcha, autoRecovery: store.autoRecovery, turnCheckInterval: store.turnCheckInterval, turnSessionCount: store.turnSessionCount)
-                runtime.applySplitTunneling(store.splitTunneling)
+                runtime.applySplitTunneling(from: store)
                 try runtime.prepare(selected)
                 store.rememberSelection(selected.id)
                 await vpn.connect(using: runtime)

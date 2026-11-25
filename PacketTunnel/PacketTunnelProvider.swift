@@ -102,7 +102,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         guard !stopped, lifecycleTask == nil, amneziaRepairTask == nil, turnMigrationTask == nil, snapshot.phase == .connected,
               recoveryProfileIsSelected,
               TemporaryFullTunnelPolicy.supported(isTURN: isTURN, isDNS: isDNS || isManagedDNS,
-                isAmnezia: isAmnezia, amneziaSplit: savedSettings.amneziaSplitEnabled ?? false) else { return nil }
+                isAmnezia: isAmnezia, amneziaSplit: savedSettings.effectiveAmneziaSplitEnabled) else { return nil }
         guard enabled != temporaryFullTunnel else { return publishFullTunnel() }
         let token = generation
         let previous = temporaryFullTunnel

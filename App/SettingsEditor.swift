@@ -170,7 +170,7 @@ struct SettingsEditor: View {
                 Toggle("Сплит-туннель для Amnezia", isOn: $amneziaSplitEnabled)
                     .accessibilityIdentifier("amneziaSplitEnabled")
             } footer: {
-                Text("По умолчанию сплит применяется только в VK TURN proxy. Здесь его можно включить для Amnezia. DNS-режим использует полный туннель. Push-правила действуют отдельно.")
+                Text("По умолчанию сплит применяется к VK TURN proxy и Amnezia. DNS-режим использует полный туннель. Push-правила действуют отдельно.")
             }
             Section {
                 Toggle("Apple push through VPN", isOn: Binding(get: { splitTunneling.pushNotifications?.apple ?? false }, set: { value in

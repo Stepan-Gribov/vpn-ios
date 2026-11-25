@@ -244,6 +244,8 @@ enum AppearanceMode: String, Codable, CaseIterable, Identifiable {
 }
 
 struct AppSettings: Codable, Equatable {
+    static let defaultAmneziaSplitEnabled = true
+
     // Optional so builds preceding split tunneling still decode without losing settings.
     var splitTunneling: SplitTunnelSettings?
     var amneziaSplitEnabled: Bool?
@@ -291,6 +293,8 @@ struct AppSettings: Codable, Equatable {
     var appearance: AppearanceMode = .system
     var logLevel = "warning"
     var webDAV: WebDAVSettings?
+
+    var effectiveAmneziaSplitEnabled: Bool { amneziaSplitEnabled ?? Self.defaultAmneziaSplitEnabled }
 
     var isAutoReconnectOnDropEnabled: Bool {
         get { autoReconnectOnDrop ?? false }

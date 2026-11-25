@@ -11,7 +11,7 @@ enum TemporaryFullTunnelPolicy {
     }
     static func applying(to saved: AppSettings, isTURN: Bool, isDNS: Bool, isAmnezia: Bool, full: Bool) -> AppSettings {
         var value = saved
-        if full || !supported(isTURN: isTURN, isDNS: isDNS, isAmnezia: isAmnezia, amneziaSplit: saved.amneziaSplitEnabled ?? false) {
+        if full || !supported(isTURN: isTURN, isDNS: isDNS, isAmnezia: isAmnezia, amneziaSplit: saved.effectiveAmneziaSplitEnabled) {
             value.splitTunneling?.mode = .disabled
         }
         return value

@@ -18,9 +18,11 @@ final class SplitTunnelingTests: XCTestCase {
                 XCTAssertEqual(full.splitTunneling?.pushNotifications, saved.splitTunneling?.pushNotifications)
                 XCTAssertEqual(full.ipv6Enabled, ipv6)
                 XCTAssertEqual(TemporaryFullTunnelPolicy.applying(to: saved, isTURN: true, isDNS: false, isAmnezia: false, full: false), saved)
-                XCTAssertEqual(TemporaryFullTunnelPolicy.applying(to: saved, isTURN: false, isDNS: false, isAmnezia: true, full: false).splitTunneling?.mode, .disabled)
-                saved.amneziaSplitEnabled = true
                 XCTAssertEqual(TemporaryFullTunnelPolicy.applying(to: saved, isTURN: false, isDNS: false, isAmnezia: true, full: false), saved)
+                XCTAssertEqual(TemporaryFullTunnelPolicy.applying(to: saved, isTURN: false, isDNS: false, isAmnezia: true, full: true), full)
+                saved.amneziaSplitEnabled = false
+                XCTAssertEqual(TemporaryFullTunnelPolicy.applying(to: saved, isTURN: false, isDNS: false, isAmnezia: true, full: false).splitTunneling?.mode, .disabled)
+                XCTAssertEqual(TemporaryFullTunnelPolicy.applying(to: saved, isTURN: true, isDNS: false, isAmnezia: false, full: false), saved)
                 XCTAssertEqual(TemporaryFullTunnelPolicy.applying(to: saved, isTURN: true, isDNS: true, isAmnezia: false, full: false).splitTunneling?.mode, .disabled)
             }
         }
@@ -31,15 +33,25 @@ final class SplitTunnelingTests: XCTestCase {
         let name = "full-tunnel-tests-" + UUID().uuidString
         let defaults = UserDefaults(suiteName: name)!
         defer { defaults.removePersistentDomain(forName: name); try? FileManager.default.removeItem(at: directory) }
-        let store = SimpleStore(fileURL: directory.appendingPathComponent("profiles.json"), defaults: defaults)
-        store.amneziaSplitEnabled = true; store.fullTunnelMinutes = 0
+        let file = directory.appendingPathComponent("profiles.json")
+        let store = SimpleStore(fileURL: file, defaults: defaults)
+        XCTAssertTrue(store.amneziaSplitEnabled)
+        XCTAssertNil(defaults.object(forKey: "simple.amneziaSplitEnabled"))
+        store.amneziaSplitEnabled = false
+        store.fullTunnelMinutes = 0
+        XCTAssertFalse(SimpleStore(fileURL: file, defaults: defaults).amneziaSplitEnabled)
         let backup = try store.backup()
         let restored = try ApplicationBackup.decode(backup.encoded())
-        XCTAssertEqual(restored.amneziaSplitEnabled, true); XCTAssertEqual(restored.fullTunnelMinutes, 0)
+        XCTAssertEqual(restored.amneziaSplitEnabled, false)
+        XCTAssertEqual(restored.fullTunnelMinutes, 0)
+        store.amneziaSplitEnabled = true
+        try store.restore(restored)
+        XCTAssertFalse(store.amneziaSplitEnabled)
         var legacy = try XCTUnwrap(JSONSerialization.jsonObject(with: backup.encoded()) as? [String: Any])
         legacy.removeValue(forKey: "amneziaSplitEnabled"); legacy.removeValue(forKey: "fullTunnelMinutes")
         try store.restore(ApplicationBackup.decode(JSONSerialization.data(withJSONObject: legacy)))
-        XCTAssertFalse(store.amneziaSplitEnabled); XCTAssertEqual(store.fullTunnelMinutes, 15)
+        XCTAssertTrue(store.amneziaSplitEnabled)
+        XCTAssertEqual(store.fullTunnelMinutes, 15)
         legacy["fullTunnelMinutes"] = -1
         XCTAssertThrowsError(try ApplicationBackup.decode(JSONSerialization.data(withJSONObject: legacy)))
     }
@@ -183,9 +195,10 @@ final class SplitTunnelingTests: XCTestCase {
         try restored.saveSplitTunneling(split)
         XCTAssertEqual(restored.splitTunneling.activeEntries.map(\.address), ["proxy.test"])
         XCTAssertEqual(restored.splitTunneling.bypassEntries.map(\.address), ["direct.test"])
-        let runtime = AppStore(); runtime.applySplitTunneling(split)
+        let runtime = AppStore(); runtime.applySplitTunneling(from: restored)
         let published = try JSONDecoder().decode(AppSettings.self, from: XCTUnwrap(AppGroup.defaults.data(forKey: AppGroup.settingsKey)))
         XCTAssertEqual(published.splitTunneling, split)
+        XCTAssertEqual(published.amneziaSplitEnabled, true)
         let old = try JSONSerialization.jsonObject(with: JSONEncoder().encode(AppSettings())) as! [String: Any]
         XCTAssertNil(try JSONDecoder().decode(AppSettings.self, from: JSONSerialization.data(withJSONObject: old)).splitTunneling)
     }

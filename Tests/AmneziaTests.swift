@@ -335,7 +335,7 @@ final class AmneziaTests: XCTestCase {
         let value = try XCTUnwrap(store.configurations.first { $0.mode == .amnezia })
         let runtime = AppStore()
         runtime.applyAutomation(autoCaptcha: store.autoCaptcha, autoRecovery: true, turnCheckInterval: store.turnCheckInterval)
-        runtime.applySplitTunneling(store.splitTunneling)
+        runtime.applySplitTunneling(from: store)
         try runtime.prepare(value)
         let vpn = VPNManager()
         await vpn.load()
@@ -490,12 +490,20 @@ final class AmneziaTests: XCTestCase {
             settings.splitTunneling = split
             let json = XrayConfigurationBuilder.build(profile: value.profile, settings: settings)
             let baseline = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
-            let root = TunnelConfiguration.applying(to: baseline, settings: settings, isTURN: false)
+            let effective = TemporaryFullTunnelPolicy.applying(to: settings, isTURN: false, isDNS: false, isAmnezia: true, full: false)
+            let root = TunnelConfiguration.applying(to: baseline, settings: effective, isTURN: false)
             XCTAssertNotNil(root["tndtun_amnezia"])
             let rules = try XCTUnwrap((root["routing"] as? [String: Any])?["rules"] as? [[String: Any]])
             XCTAssertFalse(rules.contains { ($0["domain"] as? [String])?.contains("domain:example.com") == true })
             let selected = rules.first { ($0["ip"] as? [String])?.contains("203.0.113.0/24") == true }
             XCTAssertEqual(selected?["outboundTag"] as? String, mode == .bypassSelected ? "direct" : "proxy")
+            let fallback = rules.first { $0["network"] as? String == "tcp,udp" }
+            XCTAssertEqual(fallback?["outboundTag"] as? String, mode == .bypassSelected ? "proxy" : "direct")
+            settings.amneziaSplitEnabled = false
+            let disabled = TemporaryFullTunnelPolicy.applying(to: settings, isTURN: false, isDNS: false, isAmnezia: true, full: false)
+            let unsplitRoot = TunnelConfiguration.applying(to: baseline, settings: disabled, isTURN: false)
+            let unsplitRules = try XCTUnwrap((unsplitRoot["routing"] as? [String: Any])?["rules"] as? [[String: Any]])
+            XCTAssertFalse(unsplitRules.contains { ($0["ip"] as? [String])?.contains("203.0.113.0/24") == true })
             let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".json")
             defer { try? FileManager.default.removeItem(at: file) }
             try JSONSerialization.data(withJSONObject: root).write(to: file)

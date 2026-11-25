@@ -65,8 +65,7 @@ final class PanelManager: ObservableObject {
             let selected = (vpn.tunnelIsActive ? vpn.connectedProfileID : nil) ?? store.selectedProfileID ??
                 AppGroup.defaults.string(forKey: AppGroup.activeProfileKey)
             runtime.restoreSelection(store.availableConfigurations, profileID: selected)
-            runtime.applySplitTunneling(store.splitTunneling)
-            runtime.applySplitOptions(amnezia: store.amneziaSplitEnabled, minutes: store.fullTunnelMinutes)
+            runtime.applySplitTunneling(from: store)
             runtime.applyAutomation(autoCaptcha: store.autoCaptcha, autoRecovery: store.autoRecovery,
                                     turnCheckInterval: store.turnCheckInterval)
         }
@@ -305,7 +304,7 @@ final class PanelManager: ObservableObject {
     private func applyChanges() {
         let oldSplit = runtime?.settings.splitTunneling, oldDNS = runtime?.settings.remoteDNS, oldVPNDNS = runtime?.settings.vpnDNS
         runtime?.applyPanelDNS(store.applicationDNSServers)
-        runtime?.applySplitTunneling(store.splitTunneling)
+        runtime?.applySplitTunneling(from: store)
         runtime?.applyAutomation(autoCaptcha: store.autoCaptcha, autoRecovery: store.autoRecovery, turnCheckInterval: store.turnCheckInterval)
         guard let runtime, let vpn else { return }
         if vpn.tunnelIsActive, oldSplit != runtime.settings.splitTunneling || oldDNS != runtime.settings.remoteDNS || oldVPNDNS != runtime.settings.vpnDNS {

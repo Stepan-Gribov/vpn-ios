@@ -9,7 +9,10 @@ final class SimpleStore: ObservableObject {
     @Published var autoCaptcha = false { didSet { defaults.set(autoCaptcha, forKey: "simple.autoCaptcha") } }
     @Published var autoConnectOnLaunch = false { didSet { defaults.set(autoConnectOnLaunch, forKey: "simple.autoConnectOnLaunch") } }
     @Published var autoRecovery = true { didSet { defaults.set(autoRecovery, forKey: "simple.autoRecovery") } }
-    @Published var amneziaSplitEnabled = false { didSet { defaults.set(amneziaSplitEnabled, forKey: "simple.amneziaSplitEnabled") } }
+    private static let amneziaSplitKey = "simple.amneziaSplitEnabled"
+    @Published var amneziaSplitEnabled = AppSettings.defaultAmneziaSplitEnabled {
+        didSet { defaults.set(amneziaSplitEnabled, forKey: Self.amneziaSplitKey) }
+    }
     @Published var fullTunnelMinutes = TemporaryFullTunnelPolicy.defaultMinutes { didSet { defaults.set(fullTunnelMinutes, forKey: "simple.fullTunnelMinutes") } }
     @Published var turnCheckInterval = TURNHealthCheckPolicy.defaultInterval {
         didSet { defaults.set(turnCheckInterval, forKey: "simple.turnCheckInterval") }
@@ -68,7 +71,8 @@ final class SimpleStore: ObservableObject {
         autoCaptcha = false
         autoConnectOnLaunch = defaults.bool(forKey: "simple.autoConnectOnLaunch")
         autoRecovery = defaults.object(forKey: "simple.autoRecovery") as? Bool ?? true
-        amneziaSplitEnabled = defaults.bool(forKey: "simple.amneziaSplitEnabled")
+        _amneziaSplitEnabled = Published(initialValue: defaults.object(forKey: Self.amneziaSplitKey) as? Bool
+            ?? AppSettings.defaultAmneziaSplitEnabled)
         let minutes = defaults.object(forKey: "simple.fullTunnelMinutes") as? Int
         fullTunnelMinutes = minutes.flatMap { TemporaryFullTunnelPolicy.minutes.contains($0) ? $0 : nil } ?? TemporaryFullTunnelPolicy.defaultMinutes
         turnCheckInterval = TURNHealthCheckPolicy.interval(defaults.object(forKey: "simple.turnCheckInterval") as? Int)
@@ -200,7 +204,7 @@ final class SimpleStore: ObservableObject {
                                  splitTunneling: splitTunneling ?? self.splitTunneling,
                                  selectedProfileID: selected.flatMap { id in availableConfigurations.contains(where: { $0.id == id }) ? id : nil },
                                  turnCheckInterval: turnCheckInterval ?? self.turnCheckInterval, applicationDNSServers: applicationDNSServers.isEmpty ? nil : applicationDNSServers, applicationDNSTunnel: applicationDNSTunnel, autoConnectOnLaunch: (autoConnectOnLaunch ?? self.autoConnectOnLaunch) ? true : nil,
-                                 amneziaSplitEnabled: (amneziaSplitEnabled ?? self.amneziaSplitEnabled) ? true : nil,
+                                 amneziaSplitEnabled: amneziaSplitEnabled ?? self.amneziaSplitEnabled,
                                  fullTunnelMinutes: (fullTunnelMinutes ?? self.fullTunnelMinutes) == TemporaryFullTunnelPolicy.defaultMinutes ? nil : (fullTunnelMinutes ?? self.fullTunnelMinutes),
                                  turnSessionCount: TURNSettings.normalizedSessions(turnSessionCount ?? self.turnSessionCount))
     }
@@ -246,7 +250,7 @@ final class SimpleStore: ObservableObject {
         savedDNSServers = value.savedDNSServers
         mode = value.mode; autoCaptcha = false; autoRecovery = value.autoRecovery
         autoConnectOnLaunch = value.autoConnectOnLaunch ?? false
-        amneziaSplitEnabled = value.amneziaSplitEnabled ?? false
+        amneziaSplitEnabled = value.amneziaSplitEnabled ?? AppSettings.defaultAmneziaSplitEnabled
         fullTunnelMinutes = value.fullTunnelMinutes ?? TemporaryFullTunnelPolicy.defaultMinutes
         turnCheckInterval = value.effectiveTURNCheckInterval
         turnSessionCount = value.effectiveTURNSessionCount
@@ -303,13 +307,10 @@ final class AppStore: ObservableObject {
         save()
     }
 
-    func applySplitTunneling(_ value: SplitTunnelSettings) {
-        settings.splitTunneling = value
-        save()
-    }
-
-    func applySplitOptions(amnezia: Bool, minutes: Int) {
-        settings.amneziaSplitEnabled = amnezia
+    func applySplitTunneling(from store: SimpleStore) {
+        settings.splitTunneling = store.splitTunneling
+        settings.amneziaSplitEnabled = store.amneziaSplitEnabled
+        let minutes = store.fullTunnelMinutes
         settings.fullTunnelMinutes = TemporaryFullTunnelPolicy.minutes.contains(minutes) ? minutes : TemporaryFullTunnelPolicy.defaultMinutes
         save()
     }

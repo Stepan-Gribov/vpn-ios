@@ -69,6 +69,7 @@ struct ApplicationBackup: Codable, Equatable, Identifiable {
             throw ConfigurationError("The selected profile is missing from the backup.")
         }
         var value = self
+        value.amneziaSplitEnabled = amneziaSplitEnabled ?? AppSettings.defaultAmneziaSplitEnabled
         value.turnCheckInterval = effectiveTURNCheckInterval
         value.turnSessionCount = effectiveTURNSessionCount
         value.profiles = try profiles.filter { !$0.isBuiltInDNS }.map { profile in var item = profile; item.managed = nil; return try item.validated() }

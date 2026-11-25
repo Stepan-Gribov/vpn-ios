@@ -624,6 +624,20 @@ final class TnDtunUITests: XCTestCase {
         XCTAssertEqual(interval.value as? String, "2 min")
     }
 
+    func testAmneziaSplitStartsEnabledAndCanBeTurnedOff() {
+        openSplitSettings()
+        let toggle = app.switches["amneziaSplitEnabled"]
+        XCTAssertTrue(toggle.waitForExistence(timeout: 5))
+        XCTAssertEqual(toggle.value as? String, "1")
+        flip(toggle)
+        XCTAssertEqual(toggle.value as? String, "0")
+        app.buttons["saveAutomation"].tap()
+        app.terminate(); app.launchArguments = ["--ui-testing"]; app.launch()
+        openSplitSettings()
+        XCTAssertTrue(toggle.waitForExistence(timeout: 5))
+        XCTAssertEqual(toggle.value as? String, "0")
+    }
+
     func testSplitTunnelSeparateListsJSONCancelAndPersistence() {
         openSplitSettings()
         app.buttons["splitMode_bypassSelected"].tap()

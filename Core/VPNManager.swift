@@ -220,7 +220,7 @@ final class VPNManager: ObservableObject {
                   store.availableConfigurations.contains(where: { $0.id == id }) else { return }
             runtime.applyAutomation(autoCaptcha: store.autoCaptcha, autoRecovery: store.autoRecovery,
                                     turnCheckInterval: store.turnCheckInterval, turnSessionCount: store.turnSessionCount)
-            runtime.applySplitTunneling(store.splitTunneling)
+            runtime.applySplitTunneling(from: store)
             try runtime.prepare(selected)
             await connect(using: runtime)
         } catch is CancellationError { return }
