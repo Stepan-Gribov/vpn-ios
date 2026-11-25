@@ -9,7 +9,7 @@ final class SimpleStore: ObservableObject {
     @Published var autoCaptcha = false { didSet { defaults.set(autoCaptcha, forKey: "simple.autoCaptcha") } }
     @Published var autoConnectOnLaunch = false { didSet { defaults.set(autoConnectOnLaunch, forKey: "simple.autoConnectOnLaunch") } }
     @Published var autoRecovery = true { didSet { defaults.set(autoRecovery, forKey: "simple.autoRecovery") } }
-    private static let amneziaSplitKey = "simple.amneziaSplitEnabled"
+    private static let amneziaSplitKey = "simple.amneziaSplitPreference"
     @Published var amneziaSplitEnabled = AppSettings.defaultAmneziaSplitEnabled {
         didSet { defaults.set(amneziaSplitEnabled, forKey: Self.amneziaSplitKey) }
     }
@@ -92,9 +92,13 @@ final class SimpleStore: ObservableObject {
         } catch { self.loadFailed = true; self.error = "Saved configurations could not be read. The data is retained on this device." }
         // Complete a previously confirmed import if iOS terminated the app
         // between the atomic profile write and the UserDefaults update.
-        if FileManager.default.fileExists(atPath: restoreJournalURL.path) {
+        let journal = FileManager.default.fileExists(atPath: restoreJournalURL.path) ? restoreJournalURL : legacyRestoreJournalURL
+        if FileManager.default.fileExists(atPath: journal.path) {
             do {
-                let pending = try ApplicationBackup.decode(Data(contentsOf: restoreJournalURL))
+                var pending = try ApplicationBackup.decode(Data(contentsOf: journal))
+                if journal == legacyRestoreJournalURL {
+                    pending.amneziaSplitEnabled = amneziaSplitEnabled
+                }
                 try restore(pending, recovering: true)
             } catch { self.error = "Settings import could not be completed. The backup is retained so you can try again." }
         }
@@ -209,7 +213,9 @@ final class SimpleStore: ObservableObject {
                                  turnSessionCount: TURNSettings.normalizedSessions(turnSessionCount ?? self.turnSessionCount))
     }
 
-    private var restoreJournalURL: URL { fileURL.appendingPathExtension("restore.json") }
+    // Keep pre-migration journals readable without restoring their old Amnezia default.
+    private var legacyRestoreJournalURL: URL { fileURL.appendingPathExtension("restore.json") }
+    private var restoreJournalURL: URL { fileURL.appendingPathExtension("restore-v2.json") }
 
     func restore(_ backup: ApplicationBackup, recovering: Bool = false) throws {
         var value = try backup.validated()
@@ -258,7 +264,12 @@ final class SimpleStore: ObservableObject {
         loadFailed = false; error = nil
         try reloadPanelProjection()
         var profilesURL = fileURL; try? profilesURL.setResourceValues(resources)
-        if defaults.synchronize() { try? FileManager.default.removeItem(at: restoreJournalURL) }
+        if defaults.synchronize() {
+            let files = FileManager.default
+            try? files.removeItem(at: legacyRestoreJournalURL)
+            // Keep the latest journal if an older one is still awaiting cleanup.
+            if !files.fileExists(atPath: legacyRestoreJournalURL.path) { try? files.removeItem(at: restoreJournalURL) }
+        }
     }
 
     private func persist(_ values: [SimpleConfiguration]) throws {
@@ -309,7 +320,7 @@ final class AppStore: ObservableObject {
 
     func applySplitTunneling(from store: SimpleStore) {
         settings.splitTunneling = store.splitTunneling
-        settings.amneziaSplitEnabled = store.amneziaSplitEnabled
+        settings.amneziaSplitPreference = store.amneziaSplitEnabled
         let minutes = store.fullTunnelMinutes
         settings.fullTunnelMinutes = TemporaryFullTunnelPolicy.minutes.contains(minutes) ? minutes : TemporaryFullTunnelPolicy.defaultMinutes
         save()

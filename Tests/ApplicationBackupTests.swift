@@ -319,7 +319,7 @@ final class ApplicationBackupTests: XCTestCase {
                 XCTAssertEqual(copy, incoming)
                 XCTAssertFalse(destination.configurations.contains { $0.id == old.id })
             }
-            XCTAssertFalse(FileManager.default.fileExists(atPath: file.appendingPathExtension("restore.json").path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: file.appendingPathExtension("restore-v2.json").path))
         }
     }
 
@@ -383,23 +383,30 @@ final class ApplicationBackupTests: XCTestCase {
             XCTAssertThrowsError(try store.restore(fixture()))
             XCTAssertTrue(store.configurations.isEmpty)
             XCTAssertEqual(defaults.dictionaryRepresentation() as NSDictionary, before)
-            XCTAssertFalse(FileManager.default.fileExists(atPath: file.appendingPathExtension("restore.json").path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: file.appendingPathExtension("restore-v2.json").path))
         }
     }
 
     @MainActor func testConfirmedImportJournalReplaysAfterInterruptedWrite() throws {
-        try withStore { _, file, defaults in
-            try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try Data("corrupt previous profiles".utf8).write(to: file)
-            let incoming = try fixture()
-            try incoming.encoded().write(to: file.appendingPathExtension("restore.json"))
-            let restored = SimpleStore(fileURL: file, defaults: defaults)
-            XCTAssertEqual(restored.configurations, incoming.profiles)
-            XCTAssertEqual(restored.splitTunneling, incoming.splitTunneling)
-            XCTAssertEqual(restored.savedDNSServers, incoming.savedDNSServers)
-            XCTAssertEqual(restored.selectedProfileID, incoming.selectedProfileID)
-            XCTAssertNil(restored.error)
-            XCTAssertFalse(FileManager.default.fileExists(atPath: file.appendingPathExtension("restore.json").path))
+        for (suffix, amneziaEnabled) in [("restore.json", true), ("restore-v2.json", false)] {
+            try withStore { _, file, defaults in
+                try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try Data("corrupt previous profiles".utf8).write(to: file)
+                defaults.set(false, forKey: "simple.amneziaSplitEnabled")
+                var incoming = try fixture()
+                incoming.amneziaSplitEnabled = false
+                let journal = file.appendingPathExtension(suffix)
+                try incoming.encoded().write(to: journal)
+                let restored = SimpleStore(fileURL: file, defaults: defaults)
+                XCTAssertEqual(restored.configurations, incoming.profiles)
+                XCTAssertEqual(restored.splitTunneling, incoming.splitTunneling)
+                XCTAssertEqual(restored.savedDNSServers, incoming.savedDNSServers)
+                XCTAssertEqual(restored.selectedProfileID, incoming.selectedProfileID)
+                XCTAssertEqual(restored.amneziaSplitEnabled, amneziaEnabled)
+                XCTAssertEqual(SimpleStore(fileURL: file, defaults: defaults).amneziaSplitEnabled, amneziaEnabled)
+                XCTAssertNil(restored.error)
+                XCTAssertFalse(FileManager.default.fileExists(atPath: journal.path))
+            }
         }
     }
 

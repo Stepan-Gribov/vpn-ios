@@ -248,7 +248,8 @@ struct AppSettings: Codable, Equatable {
 
     // Optional so builds preceding split tunneling still decode without losing settings.
     var splitTunneling: SplitTunnelSettings?
-    var amneziaSplitEnabled: Bool?
+    // Build 52 starts with split enabled even when an older runtime stored false.
+    var amneziaSplitPreference: Bool?
     var fullTunnelMinutes: Int?
     var routingMode: RoutingMode = .rules
     var domainStrategy: DomainStrategy = .ipIfNonMatch
@@ -294,7 +295,7 @@ struct AppSettings: Codable, Equatable {
     var logLevel = "warning"
     var webDAV: WebDAVSettings?
 
-    var effectiveAmneziaSplitEnabled: Bool { amneziaSplitEnabled ?? Self.defaultAmneziaSplitEnabled }
+    var effectiveAmneziaSplitEnabled: Bool { amneziaSplitPreference ?? Self.defaultAmneziaSplitEnabled }
 
     var isAutoReconnectOnDropEnabled: Bool {
         get { autoReconnectOnDrop ?? false }

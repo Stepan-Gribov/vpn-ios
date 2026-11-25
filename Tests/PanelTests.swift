@@ -390,9 +390,16 @@ final class PanelTests: XCTestCase {
 
     @MainActor func testSubscriptionAdditionCoalescesAndRefreshPreservesSavedIdentity() async throws {
         let v = vault(), stub = PanelStub(PanelFixture())
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        let store = SimpleStore(fileURL: dir.appendingPathComponent("profiles.json"), defaults: UserDefaults(suiteName: UUID().uuidString)!, panelVault: v)
-        let panel = PanelManager(store: store, client: PanelClient(vault: v, exchange: stub, pause: { _ in }), activationService: PanelServiceOrigins(primary: stub.fixture.trust))
+        let name = UUID().uuidString
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+        let file = dir.appendingPathComponent("profiles.json")
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: name))
+        defer { defaults.removePersistentDomain(forName: name); try? FileManager.default.removeItem(at: dir) }
+        defaults.set(false, forKey: "simple.amneziaSplitEnabled")
+        let store = SimpleStore(fileURL: file, defaults: defaults, panelVault: v)
+        XCTAssertTrue(store.amneziaSplitEnabled)
+        let client = PanelClient(vault: v, exchange: stub, pause: { _ in })
+        let panel = PanelManager(store: store, client: client, activationService: PanelServiceOrigins(primary: stub.fixture.trust))
         let runtime = AppStore(), vpn = VPNManager()
         panel.attach(runtime: runtime, vpn: vpn)
         panel.updateSubscriptionKey("qwr")
@@ -422,14 +429,20 @@ final class PanelTests: XCTestCase {
         XCTAssertEqual(rules.first { ($0["ip"] as? [String])?.contains("203.0.113.0/24") == true }?["outboundTag"] as? String, "proxy")
         XCTAssertEqual(rules.first { ($0["domain"] as? [String])?.contains("domain:manual.test") == true }?["outboundTag"] as? String, "proxy")
         store.amneziaSplitEnabled = false
-        panel.refresh(sub)
-        while panel.busy && Date() < deadline { try await Task.sleep(for: .milliseconds(10)) }
-        XCTAssertFalse(panel.busy); XCTAssertNil(panel.error)
-        XCTAssertEqual(panel.subscriptions.first?.id, sub.id)
-        XCTAssertEqual(panel.subscriptions.first?.token, sub.token)
-        XCTAssertEqual(store.configurations.map(\.id), ids)
-        XCTAssertEqual(store.splitTunneling, try PanelFixture.settings.splitTunneling.validated())
-        XCTAssertEqual(runtime.settings.amneziaSplitEnabled, false)
+        let reopened = SimpleStore(fileURL: file, defaults: defaults, panelVault: v)
+        XCTAssertFalse(reopened.amneziaSplitEnabled)
+        let refreshed = PanelManager(store: reopened, client: client, activationService: PanelServiceOrigins(primary: stub.fixture.trust))
+        await refreshed.prepareRuntime(runtime, vpn: vpn)
+        refreshed.refresh(sub)
+        let refreshDeadline = Date().addingTimeInterval(5)
+        while refreshed.busy && Date() < refreshDeadline { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertFalse(refreshed.busy); XCTAssertNil(refreshed.error)
+        XCTAssertEqual(refreshed.subscriptions.first?.id, sub.id)
+        XCTAssertEqual(refreshed.subscriptions.first?.token, sub.token)
+        XCTAssertEqual(reopened.configurations.map(\.id), ids)
+        XCTAssertEqual(reopened.splitTunneling, try PanelFixture.settings.splitTunneling.validated())
+        XCTAssertFalse(reopened.amneziaSplitEnabled)
+        XCTAssertEqual(runtime.settings.amneziaSplitPreference, false)
         let optedOut = TemporaryFullTunnelPolicy.applying(to: runtime.settings, isTURN: false, isDNS: false, isAmnezia: true, full: false)
         XCTAssertEqual(optedOut.splitTunneling?.mode, .disabled)
         let count = await stub.requests.count; XCTAssertEqual(count, 2)

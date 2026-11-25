@@ -60,12 +60,12 @@ final class PanelManager: ObservableObject {
         if let runtimeSetup { await runtimeSetup.value; return }
         let setup = Task { @MainActor in
             attach(runtime: runtime, vpn: vpn)
-            runtime.applyPanelDNS(store.applicationDNSServers)
             await vpn.load()
             let selected = (vpn.tunnelIsActive ? vpn.connectedProfileID : nil) ?? store.selectedProfileID ??
                 AppGroup.defaults.string(forKey: AppGroup.activeProfileKey)
             runtime.restoreSelection(store.availableConfigurations, profileID: selected)
             runtime.applySplitTunneling(from: store)
+            runtime.applyPanelDNS(store.applicationDNSServers)
             runtime.applyAutomation(autoCaptcha: store.autoCaptcha, autoRecovery: store.autoRecovery,
                                     turnCheckInterval: store.turnCheckInterval)
         }

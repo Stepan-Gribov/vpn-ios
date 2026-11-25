@@ -20,12 +20,25 @@ final class SplitTunnelingTests: XCTestCase {
                 XCTAssertEqual(TemporaryFullTunnelPolicy.applying(to: saved, isTURN: true, isDNS: false, isAmnezia: false, full: false), saved)
                 XCTAssertEqual(TemporaryFullTunnelPolicy.applying(to: saved, isTURN: false, isDNS: false, isAmnezia: true, full: false), saved)
                 XCTAssertEqual(TemporaryFullTunnelPolicy.applying(to: saved, isTURN: false, isDNS: false, isAmnezia: true, full: true), full)
-                saved.amneziaSplitEnabled = false
+                saved.amneziaSplitPreference = false
                 XCTAssertEqual(TemporaryFullTunnelPolicy.applying(to: saved, isTURN: false, isDNS: false, isAmnezia: true, full: false).splitTunneling?.mode, .disabled)
                 XCTAssertEqual(TemporaryFullTunnelPolicy.applying(to: saved, isTURN: true, isDNS: false, isAmnezia: false, full: false), saved)
                 XCTAssertEqual(TemporaryFullTunnelPolicy.applying(to: saved, isTURN: true, isDNS: true, isAmnezia: false, full: false).splitTunneling?.mode, .disabled)
             }
         }
+    }
+
+    func testPacketTunnelIgnoresLegacyOptOutUntilThereIsANewChoice() throws {
+        var saved = AppSettings()
+        saved.splitTunneling = SplitTunnelSettings(mode: .tunnelSelected)
+        let encoder = JSONEncoder(), decoder = JSONDecoder()
+        var legacy = try XCTUnwrap(JSONSerialization.jsonObject(with: encoder.encode(saved)) as? [String: Any])
+        legacy["amneziaSplitEnabled"] = false
+        let upgraded = try decoder.decode(AppSettings.self, from: JSONSerialization.data(withJSONObject: legacy))
+        XCTAssertEqual(TemporaryFullTunnelPolicy.applying(to: upgraded, isTURN: false, isDNS: false, isAmnezia: true, full: false).splitTunneling?.mode, .tunnelSelected)
+        saved.amneziaSplitPreference = false
+        let explicitlyDisabled = try decoder.decode(AppSettings.self, from: encoder.encode(saved))
+        XCTAssertEqual(TemporaryFullTunnelPolicy.applying(to: explicitlyDisabled, isTURN: false, isDNS: false, isAmnezia: true, full: false).splitTunneling?.mode, .disabled)
     }
 
     @MainActor func testTemporaryOptionsSurviveBackupAndLegacyImport() throws {
@@ -36,7 +49,6 @@ final class SplitTunnelingTests: XCTestCase {
         let file = directory.appendingPathComponent("profiles.json")
         let store = SimpleStore(fileURL: file, defaults: defaults)
         XCTAssertTrue(store.amneziaSplitEnabled)
-        XCTAssertNil(defaults.object(forKey: "simple.amneziaSplitEnabled"))
         store.amneziaSplitEnabled = false
         store.fullTunnelMinutes = 0
         XCTAssertFalse(SimpleStore(fileURL: file, defaults: defaults).amneziaSplitEnabled)
@@ -198,7 +210,7 @@ final class SplitTunnelingTests: XCTestCase {
         let runtime = AppStore(); runtime.applySplitTunneling(from: restored)
         let published = try JSONDecoder().decode(AppSettings.self, from: XCTUnwrap(AppGroup.defaults.data(forKey: AppGroup.settingsKey)))
         XCTAssertEqual(published.splitTunneling, split)
-        XCTAssertEqual(published.amneziaSplitEnabled, true)
+        XCTAssertEqual(published.amneziaSplitPreference, true)
         let old = try JSONSerialization.jsonObject(with: JSONEncoder().encode(AppSettings())) as! [String: Any]
         XCTAssertNil(try JSONDecoder().decode(AppSettings.self, from: JSONSerialization.data(withJSONObject: old)).splitTunneling)
     }

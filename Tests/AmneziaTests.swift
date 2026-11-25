@@ -499,7 +499,7 @@ final class AmneziaTests: XCTestCase {
             XCTAssertEqual(selected?["outboundTag"] as? String, mode == .bypassSelected ? "direct" : "proxy")
             let fallback = rules.first { $0["network"] as? String == "tcp,udp" }
             XCTAssertEqual(fallback?["outboundTag"] as? String, mode == .bypassSelected ? "proxy" : "direct")
-            settings.amneziaSplitEnabled = false
+            settings.amneziaSplitPreference = false
             let disabled = TemporaryFullTunnelPolicy.applying(to: settings, isTURN: false, isDNS: false, isAmnezia: true, full: false)
             let unsplitRoot = TunnelConfiguration.applying(to: baseline, settings: disabled, isTURN: false)
             let unsplitRules = try XCTUnwrap((unsplitRoot["routing"] as? [String: Any])?["rules"] as? [[String: Any]])
