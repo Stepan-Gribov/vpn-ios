@@ -1,5 +1,6 @@
 import SwiftUI
 import SwiftyXrayKit
+import UniformTypeIdentifiers
 
 struct ConfigurationEditor: View {
     @Environment(\.dismiss) private var dismiss
@@ -11,6 +12,7 @@ struct ConfigurationEditor: View {
     @State private var error: String?
     @State private var importError: String?
     @State private var importedJSON = false
+    @State private var choosingTelemostFile = false
     @State private var importedResolver = false
     @State private var newResolver = ""
     @State private var capturingDNS = false
@@ -21,7 +23,8 @@ struct ConfigurationEditor: View {
     var body: some View {
         NavigationStack {
             Form {
-                if configuration.mode == .amnezia { amneziaFields }
+                if configuration.isTelemost { telemostFields }
+                else if configuration.mode == .amnezia { amneziaFields }
                 else {
                     clipboardImport
                     if configuration.mode == .turn { turnFields } else { dnsFields }
@@ -29,7 +32,7 @@ struct ConfigurationEditor: View {
                 if let error { Section { Label(error, systemImage: "exclamationmark.circle").foregroundStyle(.red).font(.subheadline) } }
             }
             .scrollDismissesKeyboard(.interactively)
-            .navigationTitle(configuration.mode.title)
+            .navigationTitle(configuration.isTelemost ? "Telemost" : configuration.mode.title)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
@@ -38,11 +41,19 @@ struct ConfigurationEditor: View {
                     Button("Done") { focusedField = nil }.accessibilityIdentifier("finishConfigurationInput")
                 }
             }
-            .alert("Could not paste JSON", isPresented: Binding(
+            .alert("Could not import JSON", isPresented: Binding(
                 get: { importError != nil }, set: { if !$0 { importError = nil } }
             )) {
                 Button("OK", role: .cancel) { importError = nil }
             } message: { Text(importError ?? "") }
+            .fileImporter(isPresented: $choosingTelemostFile, allowedContentTypes: [.json]) { result in
+                do {
+                    let url = try result.get()
+                    let scoped = url.startAccessingSecurityScopedResource()
+                    defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+                    try importTelemost(RecoveryTransportStore.readConfiguration(from: url))
+                } catch { importError = error.localizedDescription }
+            }
             .task {
                 if configuration.mode == .dns && canCaptureDNS {
                     await captureDNS(selectFirst: isNewConfiguration, automatic: true)
@@ -128,6 +139,37 @@ struct ConfigurationEditor: View {
                 Text("A UUID is required to connect. The transport key must match the server. Leave it blank if the server does not use wrapping.")
             }
         }
+    }
+
+    private var telemostFields: some View {
+        Section {
+            field("Name", placeholder: "Telemost", text: Binding(
+                get: { configuration.telemostName ?? "" },
+                set: { configuration.telemostName = $0 }
+            ), id: "telemostProfileName")
+            Button("Import JSON file", systemImage: "folder") { choosingTelemostFile = true }
+                .accessibilityIdentifier("importTelemostFile")
+            PasteButton(payloadType: String.self) { values in
+                guard let text = values.first else { return }
+                do { try importTelemost(Data(text.utf8)) }
+                catch { importError = error.localizedDescription }
+            }
+            .accessibilityLabel("Paste Telemost JSON")
+            .accessibilityIdentifier("pasteTelemostJSON")
+            if configuration.telemostRecovery?.isEmpty == false {
+                Label("Configuration ready", systemImage: "checkmark.circle")
+                    .foregroundStyle(.secondary)
+            }
+        } footer: {
+            Text("Import the Telemost JSON you received, then tap Save.")
+        }
+    }
+
+    private func importTelemost(_ data: Data) throws {
+        let input = try RecoveryTransportStore.TelemostInput.normalized(data)
+        configuration.vlessID = input.vlessID.uuidString
+        configuration.telemostRecovery = input.recovery
+        error = nil
     }
 
     private var dnsFields: some View {

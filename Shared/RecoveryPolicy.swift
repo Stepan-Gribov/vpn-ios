@@ -190,7 +190,7 @@ struct RecoveryBudget {
     mutating func resumeAfterCooldown() { attempts = 0 }
 }
 
-struct HTTPProbeRequest {
+struct HTTPProbeRequest: Sendable {
     // Manual RealDelay: one fresh HTTPS request, including DNS/TCP/TLS when needed.
     static let realDelayURL = "https://www.gstatic.com/generate_204"
     static let realDelayTimeout: TimeInterval = 10

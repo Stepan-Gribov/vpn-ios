@@ -102,11 +102,38 @@ final class SimpleStore: ObservableObject {
                 try restore(pending, recovering: true)
             } catch { self.error = "Settings import could not be completed. The backup is retained so you can try again." }
         }
+        if fileURL == nil { migrateLegacyTelemost() }
         do { try reloadPanelProjection() }
         catch { self.error = error.localizedDescription }
     }
 
-    var visibleConfigurations: [SimpleConfiguration] { availableConfigurations.filter { $0.mode == mode } }
+    var visibleConfigurations: [SimpleConfiguration] {
+        let visible = availableConfigurations.filter { $0.mode == mode }
+        guard mode == .turn else { return visible }
+        return visible.filter { !$0.isTelemost } + visible.filter(\.isTelemost)
+    }
+
+    private func migrateLegacyTelemost() {
+        let migrationKey = "simple.telemostProfileMigrated"
+        guard !loadFailed, !defaults.bool(forKey: migrationKey) else { return }
+        do {
+            let legacy = try RecoveryTransportStore.legacyTelemostStore()
+            if let input = try legacy.load() {
+                let id = RecoveryTransportStore.legacyTelemostProfileID
+                if !configurations.contains(where: { $0.id == id }) {
+                    var profile = SimpleConfiguration()
+                    profile.id = id
+                    profile.vlessID = input.vlessID.uuidString
+                    profile.telemostRecovery = input.recovery
+                    try save(profile)
+                }
+                defaults.set(true, forKey: migrationKey)
+                try? legacy.remove()
+            }
+        } catch {
+            RuntimeLog.write("Saved Telemost profile migration failed. The original file is retained.")
+        }
+    }
 
     func save(_ configuration: SimpleConfiguration) throws {
         guard !configuration.isBuiltInDNS else { throw ConfigurationError("The built-in DNS profile cannot be changed. Add another DNS profile instead.") }
@@ -332,6 +359,7 @@ final class AppStore: ObservableObject {
             try FileManager.default.removeItem(at: url)
         }
         try ManagedDNSStore.clear()
+        try RecoveryTransportStore.prepareTelemost(profileID: "", recovery: nil)
         for key in [AppGroup.activeConfigKey, AppGroup.turnStatusKey, AppGroup.recoveryStatusKey,
                     AppGroup.recoveryActionKey, "simple.turn.wrapKey"] { AppGroup.defaults.removeObject(forKey: key) }
         profiles = []; activeProfileId = nil; turnSettings = TURNSettings()
@@ -387,6 +415,7 @@ final class AppStore: ObservableObject {
               let url = AppGroup.activeConfigURL else { return false }
         do {
             let json = XrayConfigurationBuilder.build(profile: profile, settings: settings)
+            try RecoveryTransportStore.prepareTelemost(profileID: profile.id, recovery: profile.telemostRecovery)
             try Data(json.utf8).write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
             AppGroup.defaults.set(json, forKey: AppGroup.activeConfigKey)
             return true

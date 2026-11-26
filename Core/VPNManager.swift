@@ -62,6 +62,7 @@ final class VPNManager: ObservableObject {
             recovery.phase = fixture == "captcha" ? .captcha : (fixture == "retry" ? .failed : (fixture == "connected" ? .connected : .disconnected))
             recovery.detail = fixture == "retry" ? "Connection failed.\nPlease retry." : "VK verification required"
             turnCaptchaRequired = fixture == "captcha"
+            turnCaptchaAgeMilliseconds = Int64(ProcessInfo.processInfo.environment["TNDTUN_UI_CHALLENGE_AGE_MS"] ?? "") ?? 0
             turnCaptchaURL = "" // No hidden browser is needed for a static layout check.
             turnReady = fixture == "connected"
             connectedProfileID = fixture == "disconnected" ? nil : ProcessInfo.processInfo.environment["TNDTUN_UI_PROFILE_ID"]
@@ -154,9 +155,12 @@ final class VPNManager: ObservableObject {
         do {
             let managers = try await NETunnelProviderManager.loadAllFromPreferences()
             guard commandID == token else { return }
-            manager = managers.first(where: {
+            let owned = managers.filter {
                 ($0.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier == AppGroup.tunnelBundleIdentifier
-            })
+            }
+            manager = owned.first {
+                [.connecting, .connected, .reasserting, .disconnecting].contains($0.connection.status)
+            } ?? owned.first { !Self.isLegacyTelemost($0) } ?? owned.first
             preferencesLoaded = true
             status = manager?.connection.status ?? .disconnected
             connectionWasActive = status == .connected
@@ -164,6 +168,7 @@ final class VPNManager: ObservableObject {
             connectedProfileID = (manager?.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration?["profileId"] as? String
             updateStatisticsLoop()
             if let existing = manager,
+               !Self.isLegacyTelemost(existing),
                existing.localizedDescription != "TnDtun" ||
                 (!Self.automationPolicy(for: existing).isTURNProxy &&
                  (existing.isOnDemandEnabled || !(existing.onDemandRules ?? []).isEmpty)) {
@@ -343,7 +348,8 @@ final class VPNManager: ObservableObject {
         if profile.isDNS && !RecoveryTransportStore.dnsConfigured {
             return .failure("The DNS tunnel is unavailable. Update your subscription when internet access is available.")
         }
-        if profile.isTURN && !profile.isDNS && !profile.isManagedDNS && !RecoveryTransportStore.enabled && !store.turnSettings.isConfigured {
+        if profile.isTURN && !profile.isTelemost && !profile.isDNS && !profile.isManagedDNS &&
+            !RecoveryTransportStore.enabled && !store.turnSettings.isConfigured {
             return .failure("Configure the TURN transport first.")
         }
         lastError = nil
@@ -779,7 +785,11 @@ final class VPNManager: ObservableObject {
     ) {
         let configuration = (value.protocolConfiguration as? NETunnelProviderProtocol) ?? NETunnelProviderProtocol()
         configuration.providerBundleIdentifier = AppGroup.tunnelBundleIdentifier
-        configuration.serverAddress = (profile.isDNS || profile.isManagedDNS) ? "DNS tunnel" : (profile.isTURN ? turnSettings.peer : profile.address)
+        if profile.isTelemost {
+            configuration.serverAddress = "Telemost"
+        } else {
+            configuration.serverAddress = (profile.isDNS || profile.isManagedDNS) ? "DNS tunnel" : (profile.isTURN ? turnSettings.peer : profile.address)
+        }
         configuration.disconnectOnSleep = false
         configuration.providerConfiguration = [
             "profileId": profile.id,
@@ -787,6 +797,7 @@ final class VPNManager: ObservableObject {
             "isDNS": profile.isDNS,
             "isManagedDNS": profile.isManagedDNS,
             "isAmnezia": profile.isAmnezia,
+            "isTelemost": profile.isTelemost,
             "mtu": profile.isTURN ? 1280 : settings.vpnMTU,
         ]
         if let grant = profile.panelAccess {
@@ -806,6 +817,12 @@ final class VPNManager: ObservableObject {
                                       isDNS: values["isDNS"] as? Bool ?? false,
                                       isManagedDNS: values["isManagedDNS"] as? Bool ?? false,
                                       isAmnezia: values["isAmnezia"] as? Bool ?? false)
+    }
+
+    private static func isLegacyTelemost(_ manager: NETunnelProviderManager) -> Bool {
+        let values = (manager.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration ?? [:]
+        return values["profileId"] as? String == RecoveryTransportStore.legacyTelemostProfileID &&
+            values["isTelemost"] as? Bool != true
     }
 
     private func updateStatisticsLoop() {

@@ -27,6 +27,7 @@ import SwiftyXrayKit
     }
     private(set) static var usingDNS = false
     private(set) static var usingRecovery = false
+    private static var usingTelemost = false
     private(set) static var currentDNSResolver: String?
 
     static func startIfNeeded(isTURN: Bool, isDNS: Bool = false, isManagedDNS: Bool = false, usingWiFi: Bool = false, builtInInterface: String? = nil) throws {
@@ -45,14 +46,8 @@ import SwiftyXrayKit
         }
         if usingRecovery {
             let data = try usingDNS ? RecoveryTransportStore.loadDNS() : RecoveryTransportStore.load()
-            guard var config = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw BridgeError.settingsMissing }
-            config["listen"] = "127.0.0.1:\(usingDNS ? DNSConnection.port : 9000)"
-            config["start_after"] = usingDNS ? RecoveryTransportStore.dnsStartAfter : RecoveryTransportStore.startAfter
-            let payload: [String: Any] = ["provider": "recovery", "recovery": config]
-            let json = try JSONSerialization.data(withJSONObject: payload)
-            let result = KindlyTurnRuntime.start(configurationJSON: String(decoding: json, as: UTF8.self))
-            guard result == 0 else { throw BridgeError.startFailed(Int(result)) }
-            RuntimeLog.write("Recovery transport supervisor started")
+            try startRecovery(data, port: usingDNS ? DNSConnection.port : 9000,
+                              startAfter: usingDNS ? RecoveryTransportStore.dnsStartAfter : RecoveryTransportStore.startAfter)
             return
         }
         guard let data = AppGroup.defaults.data(forKey: AppGroup.turnSettingsKey),
@@ -84,11 +79,30 @@ import SwiftyXrayKit
         RuntimeLog.write("Native TURN helper started for \(settings.provider.title)")
     }
 
+    static func startTelemost(_ data: Data) throws {
+        usingDNS = false
+        usingRecovery = true
+        usingTelemost = true
+        try startRecovery(data, port: 9000, startAfter: "")
+    }
+
+    private static func startRecovery(_ data: Data, port: Int, startAfter: String) throws {
+        guard var config = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw BridgeError.settingsMissing }
+        config["listen"] = "127.0.0.1:\(port)"
+        config["start_after"] = startAfter
+        let payload: [String: Any] = ["provider": "recovery", "recovery": config]
+        let json = try JSONSerialization.data(withJSONObject: payload)
+        let result = KindlyTurnRuntime.start(configurationJSON: String(decoding: json, as: UTF8.self))
+        guard result == 0 else { throw BridgeError.startFailed(Int(result)) }
+        RuntimeLog.write("Recovery transport supervisor started")
+    }
+
     static func stop() {
         if isPlainVK { transportPreference.observe(transport: status()?.transport) }
         KindlyTurnRuntime.stop()
         usingDNS = false
         usingRecovery = false
+        usingTelemost = false
         currentDNSResolver = nil
     }
 
@@ -102,6 +116,7 @@ import SwiftyXrayKit
     }
 
     @discardableResult static func recordRouteFailure() -> Bool {
+        guard !usingTelemost else { return false }
         guard usingRecovery, let status = status(), status.ready, let profile = status.profile else { return false }
         RecoveryTransportStore.recordFailure(profile: profile, dns: usingDNS)
         return true

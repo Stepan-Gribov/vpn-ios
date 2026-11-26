@@ -7,6 +7,87 @@ import WebKit
 @testable import TnDtun
 
 final class ConfigurationTests: XCTestCase {
+    #if DEBUG || CONFERENCE_PILOT
+    private func conferencePilotInput(provider: String = "telemost", channel: String = "vp8channel",
+                                      target: String = "127.0.0.1:24443",
+                                      vlessID: String = "12345678-1234-1234-1234-123456789abc") throws -> Data {
+        let hiddify = channel == "hiddify-kcp"
+        return try JSONSerialization.data(withJSONObject: [
+            "vless_id": vlessID,
+            "recovery": ["version": 1, "listen": "127.0.0.1:9999", "start_after": "previous",
+                         "profiles": [["id": "pilot", "type": "conference", "conference": [
+                            "provider": provider, "channel": channel,
+                            "room": hiddify ? "https://telemost.yandex.ru/j/123456789" : "https://conference.example.test/room",
+                            "key": hiddify ? "" : String(repeating: "ab", count: 32), "target": target,
+                         ]]]],
+        ])
+    }
+
+    func testConferencePilotNormalizesLocalListenerAndRetainsTestVLESS() throws {
+        var checked = ""
+        let parsed = try RecoveryTransportStore.TelemostInput.normalized(conferencePilotInput()) {
+            checked = $0; return true
+        }
+        let recovery = try XCTUnwrap(JSONSerialization.jsonObject(with: parsed.recovery) as? [String: Any])
+        XCTAssertEqual(recovery["listen"] as? String, "127.0.0.1:9000")
+        XCTAssertNil(recovery["start_after"])
+        XCTAssertEqual(checked, String(decoding: parsed.recovery, as: UTF8.self))
+        XCTAssertEqual(parsed.vlessID.uuidString.lowercased(), "12345678-1234-1234-1234-123456789abc")
+    }
+
+    func testTelemostProfileSurvivesReloadAndInvalidReplacementUntilRemoved() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let url = directory.appendingPathComponent("telemost-profile.json")
+        let store = RecoveryTransportStore.LegacyTelemostStore(url: url)
+        let configuration = try conferencePilotInput(channel: "hiddify-kcp")
+        XCTAssertNil(try store.load())
+
+        let saved = try store.save(configuration)
+        let reopened = RecoveryTransportStore.LegacyTelemostStore(url: url)
+        XCTAssertEqual(try reopened.load()?.vlessID, saved.vlessID)
+        XCTAssertEqual(try reopened.load()?.recovery, saved.recovery)
+
+        XCTAssertThrowsError(try reopened.save(Data("invalid".utf8)))
+        XCTAssertEqual(try reopened.load()?.vlessID, saved.vlessID)
+        XCTAssertEqual(try reopened.load()?.recovery, saved.recovery)
+
+        try reopened.remove()
+        XCTAssertNil(try store.load())
+    }
+
+    func testConferencePilotRejectsOtherMediaRoutesAndInvalidVLESS() throws {
+        for data in try [conferencePilotInput(provider: "jitsi", channel: "datachannel"),
+                         conferencePilotInput(channel: "datachannel"),
+                         conferencePilotInput(vlessID: "not-a-uuid"),
+                         Data(repeating: 0, count: RecoveryTransportStore.maximumBytes + 1)] {
+            XCTAssertThrowsError(try RecoveryTransportStore.TelemostInput.normalized(data) { _ in true })
+        }
+        XCTAssertThrowsError(try RecoveryTransportStore.TelemostInput.normalized(conferencePilotInput()) { _ in false })
+    }
+
+    func testConferencePilotUsesTaggedNativeValidation() throws {
+        let fixture = try conferencePilotInput()
+        let normalized = try RecoveryTransportStore.TelemostInput.normalized(fixture) { _ in true }
+        try XCTSkipUnless(KindlyTurnRuntime.validateRecovery(configurationJSON: String(decoding: normalized.recovery, as: UTF8.self)),
+                          "This build excludes the native conference transport.")
+        XCTAssertNoThrow(try RecoveryTransportStore.TelemostInput.normalized(fixture))
+        XCTAssertThrowsError(try RecoveryTransportStore.TelemostInput.normalized(conferencePilotInput(target: "192.0.2.1:24443")))
+    }
+
+    func testHiddifyConferenceUsesTaggedNativeValidation() throws {
+        let fixture = try conferencePilotInput(channel: "hiddify-kcp")
+        let normalized = try RecoveryTransportStore.TelemostInput.normalized(fixture) { _ in true }
+        try XCTSkipUnless(KindlyTurnRuntime.validateRecovery(configurationJSON: String(decoding: normalized.recovery, as: UTF8.self)),
+                          "This build excludes the native Hiddify pilot.")
+        XCTAssertNoThrow(try RecoveryTransportStore.TelemostInput.normalized(fixture))
+        XCTAssertThrowsError(try RecoveryTransportStore.TelemostInput.normalized(
+            conferencePilotInput(channel: "hiddify-kcp", target: "192.0.2.1:24443")))
+    }
+    #endif
+
     @MainActor func testResumableRelayRepairPreservesHelperAndCancelsBeforeFallback() async throws {
         var events: [String] = []
         let latency = try await TURNRelayRepair.run(isCurrent: { true },

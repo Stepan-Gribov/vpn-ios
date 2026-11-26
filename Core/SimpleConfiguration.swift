@@ -13,7 +13,7 @@ enum TunnelMode: String, Codable, CaseIterable, Identifiable {
     var caption: String {
         switch self {
         case .amnezia: return "Amnezia VPN"
-        case .turn: return "VK Calls · TURN"
+        case .turn: return "VK Calls · Telemost"
         case .dns: return "DNS tunneling · DNSTT"
         }
     }
@@ -28,6 +28,8 @@ struct SimpleConfiguration: Codable, Identifiable, Equatable {
     var callLink = ""
     var server = ""
     var vlessID = ""
+    var telemostRecovery: Data?
+    var telemostName: String?
     var wrapKey = ""
     var dns = ManagedDNSSettings()
     var amneziaKey: String?
@@ -36,6 +38,7 @@ struct SimpleConfiguration: Codable, Identifiable, Equatable {
     var managed: PanelManagedProfile?
 
     var isBuiltInDNS: Bool { id.lowercased() == Self.builtInDNSID }
+    var isTelemost: Bool { mode == .turn && telemostRecovery != nil }
     static func builtInDNS() throws -> Self {
         let transport = try PanelContract.bundled().dns
         var value = Self(); value.id = builtInDNSID; value.mode = .dns
@@ -47,16 +50,33 @@ struct SimpleConfiguration: Codable, Identifiable, Equatable {
         return try value.validated()
     }
 
-    var title: String { isBuiltInDNS ? "Built-in DNS" : (managed?.title ?? (mode == .amnezia ? (amneziaName ?? "Amnezia") : (mode == .turn ? server : dns.domain))) }
+    var title: String {
+        if isBuiltInDNS { return "Built-in DNS" }
+        if let managed { return managed.title }
+        if isTelemost { return telemostName.flatMap { $0.isEmpty ? nil : $0 } ?? "Telemost" }
+        switch mode {
+        case .amnezia: return amneziaName ?? "Amnezia"
+        case .turn: return server
+        case .dns: return dns.domain
+        }
+    }
     var detail: String {
         if isBuiltInDNS { return "Always available · DNSTT" }
         if let managed { return [managed.location, "Subscription"].filter { !$0.isEmpty }.joined(separator: " · ") }
+        if isTelemost { return "Telemost · TURN" }
         return mode == .amnezia ? (amneziaProtocol ?? "Amnezia VPN") : (mode == .turn ? "VK Calls" : "DNSTT · \(dns.tunnelType.uppercased())")
     }
 
     func validated(forConnection: Bool = false) throws -> Self {
         var result = self
-        if mode == .turn {
+        if isTelemost, let telemostRecovery {
+            do {
+                let input = try RecoveryTransportStore.TelemostInput.normalized(vlessID: vlessID, recovery: telemostRecovery)
+                result.vlessID = input.vlessID.uuidString
+                result.telemostRecovery = input.recovery
+                result.telemostName = telemostName.map { String($0.trimmingCharacters(in: .whitespacesAndNewlines).prefix(80)) }
+            } catch { throw ConfigurationError("Import a valid Telemost configuration JSON.") }
+        } else if mode == .turn {
             guard let link = TURNSettings.normalizeVKCallLink(callLink) else {
                 throw ConfigurationError("Enter a VK call link: https://vk.com/call/join/…")
             }
@@ -120,6 +140,7 @@ struct SimpleConfiguration: Codable, Identifiable, Equatable {
         if mode == .turn {
             value.kind = .vless; value.address = "127.0.0.1"; value.port = 9000
             value.security = .none; value.transport = .tcp; value.credential = vlessID
+            value.telemostRecovery = telemostRecovery
         }
         return value
     }

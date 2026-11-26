@@ -48,6 +48,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     @MainActor private var isManagedDNS = false
     @MainActor private var isAmnezia = false
     @MainActor private var profileID = ""
+    @MainActor private var isTelemost = false
+    @MainActor private var telemostRecovery: Data?
     @MainActor private var snapshot = TunnelRecoverySnapshot()
     @MainActor private var budget = RecoveryBudget()
     @MainActor private var amneziaRepairTask: Task<Void, Never>?
@@ -172,6 +174,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         automationPolicy.automaticRecoveryEnabled(settings)
     }
 
+    @MainActor private var isPlainVK: Bool {
+        !isTelemost && NativeTURNBridge.isPlainVK
+    }
+
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
         Task { @MainActor in
             stopped = false
@@ -186,14 +192,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             generation = UUID()
             let token = generation
             startCompletion = completionHandler
-            let stored = AppGroup.activeConfigURL.flatMap { try? String(contentsOf: $0, encoding: .utf8) }
-                ?? AppGroup.defaults.string(forKey: AppGroup.activeConfigKey)
-            guard let stored, !stored.isEmpty else {
-                finishStart(makeError("The active configuration was not found.")); return
-            }
-            configuration = stored
             let values = (protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration ?? [:]
+            profileID = values["profileId"] as? String ?? ""
+            isTelemost = (values["isTelemost"] as? NSNumber)?.boolValue == true
             do {
+                try loadStartupConfiguration()
                 panelAccess = nil
                 if values["isPanelManaged"] as? Bool == true || values["panelAccess"] != nil {
                     guard let data = values["panelAccess"] as? Data else { throw PanelFailure("The subscription access record is missing.") }
@@ -203,19 +206,20 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             } catch { finishStart(makeError(error.localizedDescription)); return }
             startAccessMonitoring(token: token)
             mtu = (values["mtu"] as? NSNumber)?.intValue ?? 1500
-            isTURN = (values["isTURN"] as? NSNumber)?.boolValue ?? false
-            isDNS = (values["isDNS"] as? NSNumber)?.boolValue ?? false
-            isManagedDNS = (values["isManagedDNS"] as? NSNumber)?.boolValue ?? false
-            isAmnezia = (values["isAmnezia"] as? NSNumber)?.boolValue ?? false
-            profileID = values["profileId"] as? String ?? ""
+            isTURN = (values["isTURN"] as? NSNumber)?.boolValue == true
+            isDNS = (values["isDNS"] as? NSNumber)?.boolValue == true
+            isManagedDNS = (values["isManagedDNS"] as? NSNumber)?.boolValue == true
+            isAmnezia = (values["isAmnezia"] as? NSNumber)?.boolValue == true
             resetFullTunnel()
             snapshot = TunnelRecoverySnapshot(profileID: profileID, maximumAttempts: settings.recoveryMaxRetries)
             snapshot.providerProcessID = Int(getpid())
             budget = RecoveryBudget()
+            physicalPathSignature = nil
+            networkChanged = false
             startPathMonitor()
             lifecycleTask = Task { @MainActor in
                 do {
-                    if isManagedDNS { try await waitForNetworkPath(token: token) }
+                    if isManagedDNS || isTelemost { try await waitForNetworkPath(token: token) }
                     try await preparePhysicalDNS(readSystemDNS: true)
                     try await setNetworkSettings()
                     try await startInitialRuntime(token: token)
@@ -235,6 +239,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                         snapshot.latencyMilliseconds = latency
                     }
                     #endif
+                    if isTelemost { networkChanged = false }
                     publish(.connected, "Connected")
                     finishStart(nil)
                     lifecycleTask = nil
@@ -251,6 +256,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 }
             }
         }
+    }
+
+    @MainActor private func loadStartupConfiguration() throws {
+        telemostRecovery = isTelemost ? try RecoveryTransportStore.loadTelemost(profileID: profileID) : nil
+        let stored = AppGroup.activeConfigURL.flatMap { try? String(contentsOf: $0, encoding: .utf8) }
+            ?? AppGroup.defaults.string(forKey: AppGroup.activeConfigKey)
+        guard let stored, !stored.isEmpty else { throw makeError("The active configuration was not found.") }
+        configuration = stored
     }
 
     @MainActor private func startAccessMonitoring(token: UUID) {
@@ -302,19 +315,39 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 let turnProxy = isTURN && !isDNS && !isManagedDNS
                 let builtInDNS = profileID == ManagedDNSSettings.builtInProfileID
                 if NativeTURNBridge.usingRecovery || isAmnezia || turnProxy || builtInDNS {
-                    publish(.verifying, isAmnezia ? "Checking Amnezia data transfer…" : (turnProxy ? "Checking TURN data transfer…" : (builtInDNS ? "Checking DNS data transfer…" : "Checking VPN through the fallback route")))
+                    if isTelemost {
+                        publish(.verifying, "Checking internet access through Telemost…")
+                    } else {
+                        publish(.verifying, isAmnezia ? "Checking Amnezia data transfer…" : (turnProxy ? "Checking TURN data transfer…" : (builtInDNS ? "Checking DNS data transfer…" : "Checking VPN through the fallback route")))
+                    }
+                    let probeStarted = ProcessInfo.processInfo.systemUptime
                     let latency = await measureRoutePreservingTURNChallenge(token: token)
                     guard valid(token) else { throw CancellationError() }
-                    guard let latency else { throw makeError(isAmnezia ? "Amnezia is not transferring data. Check the key and server availability." : (turnProxy ? "TURN is not transferring data. Check the server and try again." : (builtInDNS ? "The built-in DNS tunnel is not transferring data on this network. Try another connection." : "The fallback route failed the VPN check."))) }
+                    if isTelemost {
+                        let elapsed = Int((ProcessInfo.processInfo.systemUptime - probeStarted) * 1000)
+                        RuntimeLog.write("Telemost HTTPS check \(latency == nil ? "failed" : "passed") in \(elapsed) ms")
+                    }
+                    guard let latency else {
+                        if isTelemost {
+                            throw makeError("Telemost joined the call, but internet traffic did not pass through the tunnel.")
+                        }
+                        throw makeError(isAmnezia ? "Amnezia is not transferring data. Check the key and server availability." : (turnProxy ? "TURN is not transferring data. Check the server and try again." : (builtInDNS ? "The built-in DNS tunnel is not transferring data on this network. Try another connection." : "The fallback route failed the VPN check.")))
+                    }
                     snapshot.latencyMilliseconds = latency
                 }
                 return
             } catch {
                 // An older, cancelled startup must not stop a newer generation.
                 guard valid(token) else { throw CancellationError() }
-                let advance = NativeTURNBridge.recordRouteFailure()
+                // A ready Telemost session can stall without closing its media link.
+                let retryTelemost = isTelemost && snapshot.phase == .verifying
+                let advance = retryTelemost || NativeTURNBridge.recordRouteFailure()
                 stopRuntime()
                 if attempt == 1 || !advance { throw error }
+                if retryTelemost {
+                    publish(.startingTURN, "Reconnecting Telemost…")
+                    try await Task.sleep(for: .milliseconds(450))
+                }
             }
         }
     }
@@ -330,23 +363,39 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         try await preparePhysicalDNS(readSystemDNS: false)
         guard valid(token), !(isTURN || isAmnezia) || recoveryProfileIsSelected else { throw CancellationError() }
         Self.tunnelPreset.apply()
-        publish(isTURN ? .startingTURN : .startingCore, (isDNS || isManagedDNS) ? "Starting DNS tunnel…" : (isTURN ? "Starting TURN…" : "Starting VPN…"))
+        let startingDetail = isTelemost ? "Joining Telemost…" :
+            ((isDNS || isManagedDNS) ? "Starting DNS tunnel…" : (isTURN ? "Starting TURN…" : "Starting VPN…"))
+        publish(isTURN ? .startingTURN : .startingCore, startingDetail)
         AppGroup.defaults.removeObject(forKey: AppGroup.turnStatusKey)
         let builtInNetwork = profileID == ManagedDNSSettings.builtInProfileID ? try await PanelPhysicalNetwork.snapshot(readSystemDNS: false) : nil
         guard valid(token), !(isTURN || isAmnezia) || recoveryProfileIsSelected else { throw CancellationError() }
-        try NativeTURNBridge.startIfNeeded(isTURN: isTURN, isDNS: isDNS, isManagedDNS: isManagedDNS,
-                                           usingWiFi: networkUsesWiFi, builtInInterface: builtInNetwork?.interface)
+        let transportStarted = ProcessInfo.processInfo.systemUptime
+        try startTransport(builtInInterface: builtInNetwork?.interface)
         startTURNCaptchaMonitoring()
         if isTURN { try await waitForTURNReady(token: token) }
         guard valid(token), !(isTURN || isAmnezia) || recoveryProfileIsSelected else { throw CancellationError() }
+        if isTelemost {
+            let elapsed = Int((ProcessInfo.processInfo.systemUptime - transportStarted) * 1000)
+            RuntimeLog.write("Telemost media and relay ready in \(elapsed) ms")
+        }
         publish(.startingCore, "Starting VPN…")
         try startPacketEngine()
+    }
+
+    @MainActor private func startTransport(builtInInterface: String?) throws {
+        if isTelemost {
+            guard let telemostRecovery else { throw makeError("The Telemost configuration is missing.") }
+            try NativeTURNBridge.startTelemost(telemostRecovery)
+            return
+        }
+        try NativeTURNBridge.startIfNeeded(isTURN: isTURN, isDNS: isDNS, isManagedDNS: isManagedDNS,
+                                           usingWiFi: networkUsesWiFi, builtInInterface: builtInInterface)
     }
 
     @MainActor private func startPacketEngine() throws {
         let recovery = NativeTURNBridge.usingRecovery
         let plainTURN = isTURN && !isDNS && !isManagedDNS && !recovery
-        let needsFallbackProbe = plainTURN || isAmnezia
+        let needsFallbackProbe = isTelemost || plainTURN || isAmnezia
         let ports = try SwiftyXray.getFreePorts(needsFallbackProbe ? 3 : 2)
         guard ports.count == (needsFallbackProbe ? 3 : 2), let port = ports.first, let latencyPort = ports.last,
               let request = HTTPProbeRequest(plainTURN ? HTTPProbeRequest.turnURL : (recovery ? HTTPProbeRequest.recoveryURL : settings.connectivityTestURL),
@@ -355,9 +404,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         let next = bridge ?? XrayBridge(packetFlow: packetFlow)
         let fallbackPort = needsFallbackProbe ? ports[1] : nil
-        let fallbackRequest = isAmnezia
-            ? HTTPProbeRequest(HTTPProbeRequest.systemFallbackURL, expectedStatusCode: 200)
-            : (plainTURN ? HTTPProbeRequest.turnFallback(settings.connectivityTestURL) : nil)
+        let fallbackRequest: HTTPProbeRequest?
+        if isTelemost {
+            fallbackRequest = HTTPProbeRequest(HTTPProbeRequest.turnURL, expectedStatusCode: 200)
+        } else if isAmnezia {
+            fallbackRequest = HTTPProbeRequest(HTTPProbeRequest.systemFallbackURL, expectedStatusCode: 200)
+        } else {
+            fallbackRequest = plainTURN ? HTTPProbeRequest.turnFallback(settings.connectivityTestURL) : nil
+        }
         bridge = next
         do {
             var runtimeSettings = settings
@@ -402,7 +456,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// Challenge lifetime belongs to the native clock, not an individual probe
     /// or an open browser. This observer also runs when automatic recovery is off.
     @MainActor private func startTURNCaptchaMonitoring() {
-        guard isTURN, !isDNS, !isManagedDNS, NativeTURNBridge.isPlainVK, turnCaptchaTask == nil else { return }
+        guard isTURN, !isDNS, !isManagedDNS, isPlainVK, turnCaptchaTask == nil else { return }
         turnCaptchaTask = Task { @MainActor in
             while !stopped && !Task.isCancelled {
                 _ = refreshTURNChallenge()
@@ -423,7 +477,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// Returns whether a native challenge is pending, including optional lanes.
     /// A failed route becomes blocked until the same challenge completes.
     @MainActor @discardableResult private func refreshTURNChallenge(blocking: Bool = false) -> Bool {
-        guard isTURN, !isDNS, !isManagedDNS, NativeTURNBridge.isPlainVK,
+        guard isTURN, !isDNS, !isManagedDNS, isPlainVK,
               let state = NativeTURNBridge.status() else { return false }
         let completedBlockedChallenge = blockedTURNChallengeID != nil && !state.captchaRequired
         if !state.captchaRequired || blockedTURNChallengeID != state.captchaID { blockedTURNChallengeID = nil }
@@ -515,15 +569,18 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         var started = ProcessInfo.processInfo.systemUptime
         var captchaPending = false
         var notified = false
-        let turnData = AppGroup.defaults.data(forKey: AppGroup.turnSettingsKey)
+        let turnData = isTelemost ? nil : AppGroup.defaults.data(forKey: AppGroup.turnSettingsKey)
         let turnSettings = turnData.flatMap { try? JSONDecoder().decode(TURNSettings.self, from: $0) } ?? TURNSettings()
         while valid(token) {
             _ = refreshTURNChallenge()
             guard valid(token) else { throw CancellationError() }
             if let data = currentTURNStatusData() { AppGroup.defaults.set(data, forKey: AppGroup.turnStatusKey) }
             if let status = NativeTURNBridge.status() {
-                if status.ready { return } // Readiness allows a real traffic check, not Connected.
-                if !status.running { throw makeError(status.lastError ?? "TURN stopped unexpectedly.") }
+                if status.ready, !isTelemost || status.transport == "conference" { return }
+                if !status.running {
+                    if isTelemost { throw makeError("Could not establish the Telemost link. Check the invitation and server.") }
+                    throw makeError(status.lastError ?? "TURN stopped unexpectedly.")
+                }
                 if status.captchaRequired != captchaPending {
                     captchaPending = status.captchaRequired
                     started = ProcessInfo.processInfo.systemUptime
@@ -544,6 +601,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
             let timeout = NativeTURNBridge.usingRecovery ? RecoveryTransportStore.readyTimeout : ConnectionDropPolicy.turnReadyTimeout(captchaPending: captchaPending, autoCaptcha: turnSettings.isAutoCaptchaEnabled)
             if ProcessInfo.processInfo.systemUptime - started >= timeout {
+                if isTelemost { throw makeError("Telemost did not join the call in time. Check the invitation and network.") }
                 throw makeError((isDNS || isManagedDNS) ? "The DNS tunnel is unavailable on this network. Choose another connection." : (captchaPending ? "VK verification was not completed in time." : "TURN relay sessions could not be established in time."))
             }
             try await Task.sleep(for: .milliseconds(250))
@@ -562,8 +620,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 let selectedInterfaces = path.availableInterfaces.filter {
                     $0.type != .other && path.usesInterfaceType($0.type)
                 }
-                let interfaces = selectedInterfaces.map { "\($0.type):\($0.name)" }.sorted().joined(separator: ",")
-                let addresses = (self.isAmnezia || (self.isTURN && NativeTURNBridge.isPlainVK))
+                let interfaces = Set(selectedInterfaces.map { "\($0.type):\($0.name)" }).sorted().joined(separator: ",")
+                // Installing utun can briefly yield a satisfied path containing
+                // only virtual interfaces. It isn't a Wi-Fi/cellular handoff.
+                if self.isTelemost, path.status == .satisfied, interfaces.isEmpty { return }
+                let addresses = (self.isAmnezia || (self.isTURN && self.isPlainVK))
                     ? PanelPhysicalNetwork.addressIdentity(interfaces: selectedInterfaces.map(\.name)) : ""
                 let signature = "\(path.status):\(interfaces):\(addresses)"
                 // Installing our own virtual route must not look like a change
@@ -577,7 +638,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 if changed {
                     self.physicalPathRevision &+= 1
                     RuntimeLog.write("Physical network changed: \(signature)")
-                    let resumableTURN = self.hasEstablishedConnection && self.lifecycleTask == nil &&
+                    let resumableTURN = !self.isTelemost && self.hasEstablishedConnection && self.lifecycleTask == nil &&
                         NativeTURNBridge.supportsConnectionResume
                     if resumableTURN {
                         // Physical sockets must follow Wi-Fi/cellular even
@@ -612,7 +673,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     @MainActor private func waitForNetworkPath(token: UUID) async throws {
         // Observe the physical route before installing the VPN's virtual route.
         let deadline = ProcessInfo.processInfo.systemUptime + 2
-        while !receivedNetworkPath && ProcessInfo.processInfo.systemUptime < deadline {
+        while (!receivedNetworkPath || (isTelemost && !networkAvailable)) && ProcessInfo.processInfo.systemUptime < deadline {
             guard valid(token) else { throw CancellationError() }
             try await Task.sleep(for: .milliseconds(20))
         }
@@ -710,7 +771,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let wasFullTunnel = temporaryFullTunnel
         resetFullTunnel()
         let repairRelay = !wasFullTunnel && !manual && automaticRecoveryEnabled && hasEstablishedConnection &&
-            coreRunning && bridge?.forwardingFailure == nil && NativeTURNBridge.isPlainVK
+            coreRunning && bridge?.forwardingFailure == nil && isPlainVK
         if repairRelay { NativeTURNBridge.recordTransportFailure(previouslyConnected: true, networkSwitch: networkSwitch) }
         recoveryIsAutomatic = !manual
         if !manual { NativeTURNBridge.recordRouteFailure() }
@@ -771,7 +832,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 switch budget.next(networkAvailable: networkAvailable, maximum: settings.recoveryMaxRetries) {
                 case .waitForNetwork: continue
                 case .exhausted:
-                    publish(.retryWait, "The server is unavailable. Retrying automatically in 30 seconds…")
+                    publish(.retryWait, isTelemost
+                        ? "Telemost is not transferring data. Retrying in 30 seconds…"
+                        : "The server is unavailable. Retrying automatically in 30 seconds…")
                     do { try await Task.sleep(for: .seconds(ConnectionDropPolicy.retryCooldown)) } catch { return }
                     guard valid(token) else { return }
                     budget.resumeAfterCooldown(); snapshot.attempt = 0
@@ -779,7 +842,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 case .attempt(let count): snapshot.attempt = count
                 }
                 do {
-                    if isManagedDNS { try await waitForNetworkPath(token: token) }
+                    if isManagedDNS || isTelemost { try await waitForNetworkPath(token: token) }
                     if isAmnezia {
                         // A manually requested reconnect refreshes system routes and DNS.
                         try await setNetworkSettings()
@@ -787,8 +850,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     }
                     try await startRuntime(token: token)
                     guard valid(token) else { return }
-                    publish(.verifying, "Checking data transfer…")
-                    try await Task.sleep(for: .seconds(1))
+                    publish(.verifying, isTelemost ? "Checking internet access through Telemost…" : "Checking data transfer…")
+                    if !isTelemost { try await Task.sleep(for: .seconds(1)) }
                     let latency = await measureRoutePreservingTURNChallenge(token: token)
                     guard valid(token) else { return }
                     guard let latency else {
@@ -950,7 +1013,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     @MainActor private var nativeVKRepairAllowed: Bool {
-        automationPolicy.isTURNProxy && NativeTURNBridge.isPlainVK && coreRunning && bridge?.forwardingFailure == nil
+        automationPolicy.isTURNProxy && isPlainVK && coreRunning && bridge?.forwardingFailure == nil
     }
 
     @MainActor private func completeRecovery(latency: Int, networkSwitch: Bool) {
@@ -1027,7 +1090,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             self.systemRouteFailed = false
             guard self.bridge?.forwardingFailure == nil, remaining(ConnectionDropPolicy.probeTimeout) > 0 else { return nil }
             let current = { self.valid(token) && self.physicalPathRevision == revision }
-            let needsPacketCheck = !transportOnly && (self.isAmnezia || (self.automationPolicy.isTURNProxy && NativeTURNBridge.isPlainVK))
+            let needsPacketCheck = !transportOnly &&
+                (self.isTelemost || self.isAmnezia || (self.automationPolicy.isTURNProxy && self.isPlainVK))
             let fallback: ((TimeInterval) async -> Int?)? = if let fallbackPort, let fallbackRequest {
                 { timeout in
                     RuntimeLog.write("Primary route probe failed; checking independent endpoint")
@@ -1035,7 +1099,21 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 }
             } else { nil }
             let transportLatency: Int?
-            if self.isAmnezia {
+            if self.isTelemost, let fallbackPort, let fallbackRequest {
+                // A slow endpoint must not consume half of the startup window.
+                let timeout = min(10, max(0, remaining(16) - (deadline != nil && needsPacketCheck ? 6 : 0)))
+                transportLatency = await withTaskGroup(of: Int?.self) { group in
+                    group.addTask { await ForwardedProbe.measure(port: port, request: request, timeout: timeout) }
+                    group.addTask { await ForwardedProbe.measure(port: fallbackPort, request: fallbackRequest, timeout: timeout) }
+                    for await result in group {
+                        if let result {
+                            group.cancelAll()
+                            return result
+                        }
+                    }
+                    return nil
+                }
+            } else if self.isAmnezia {
                 transportLatency = await RouteProbeSequence.measure(deadline: deadline,
                     reservedAfter: needsPacketCheck ? 6 : 0, now: { ProcessInfo.processInfo.systemUptime },
                     isCurrent: current,
@@ -1081,7 +1159,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 return latency.map { max($0, transportLatency) }
             }
             #endif
-            if self.isAmnezia || (self.automationPolicy.isTURNProxy && NativeTURNBridge.isPlainVK) {
+            if needsPacketCheck {
                 let configuredServer = self.settings.vpnDNS.first(where: { IPv4Address($0) != nil })
                 guard let server = configuredServer ?? (self.isAmnezia ? nil : "1.1.1.1"),
                       let bridge = self.bridge,
@@ -1184,6 +1262,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             finishStart(makeError("Connection cancelled."))
             publish(.disconnected, "VPN is disconnected")
             AppGroup.defaults.removeObject(forKey: AppGroup.turnStatusKey)
+            telemostRecovery = nil
             RuntimeLog.write("Packet tunnel stopped, reason \(reason.rawValue)")
             completionHandler()
         }
@@ -1369,7 +1448,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 refreshAmneziaTransport()
                 return
             }
-            if NativeTURNBridge.supportsConnectionResume, coreRunning, hasEstablishedConnection, lifecycleTask == nil {
+            if !isTelemost, NativeTURNBridge.supportsConnectionResume, coreRunning, hasEstablishedConnection, lifecycleTask == nil {
                 migrateResumableTURN()
                 return
             }

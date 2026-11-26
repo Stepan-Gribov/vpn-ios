@@ -17,6 +17,16 @@ final class TnDtunUITests: XCTestCase {
         app.launch()
     }
 
+    func testTelemostEditorOpensFromTURNProfiles() {
+        let turn = app.segmentedControls["modePicker"].buttons["TURN proxy"]
+        XCTAssertTrue(turn.waitForExistence(timeout: 8))
+        turn.tap()
+        app.buttons["addTelemostProfile"].tap()
+        XCTAssertTrue(app.buttons["importTelemostFile"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["saveConfiguration"].exists)
+        XCTAssertFalse(app.textFields["callLink"].exists)
+    }
+
     func testBuiltInDNSIsVisibleAndHasNoEditOrDeleteMenu() {
         app.segmentedControls["modePicker"].buttons["DNS tunnel"].tap()
         XCTAssertTrue(app.buttons["connect_tndtun.builtin.dns.v1"].waitForExistence(timeout: 5))

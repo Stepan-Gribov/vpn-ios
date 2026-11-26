@@ -51,6 +51,7 @@ enum SecurityKind: String, Codable, CaseIterable, Identifiable {
 
 struct VPNProfile: Codable, Identifiable, Hashable {
     var panelAccess: PanelAccessGrant?
+    var telemostRecovery: Data?
     var id = UUID().uuidString
     var name = "New profile"
     var kind: ProxyKind = .vless
@@ -110,6 +111,7 @@ struct VPNProfile: Codable, Identifiable, Hashable {
     var lastError: String?
 
     var isAmnezia: Bool { amneziaRuntimeJSON != nil }
+    var isTelemost: Bool { telemostRecovery != nil }
 
     var isManagedDNS: Bool { kind == .socks && address == "127.0.0.1" && port == ManagedDNSSettings.port }
 
@@ -156,7 +158,7 @@ enum DNSConnection {
         guard available else { return profiles }
         var credentials = Set(profiles.filter(\.isDNS).map(\.credential))
         let added = profiles.compactMap { profile -> VPNProfile? in
-            guard profile.isTURN, !profile.isDNS, !profile.isManagedDNS, profile.security == .none,
+            guard profile.isTURN, !profile.isTelemost, !profile.isDNS, !profile.isManagedDNS, profile.security == .none,
                   profile.transport == .tcp, !profile.credential.isEmpty,
                   credentials.insert(profile.credential).inserted else { return nil }
             var dns = profile

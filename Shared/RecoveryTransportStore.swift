@@ -13,6 +13,7 @@ import SwiftyXrayKit
 enum RecoveryTransportStore {
     static let maximumBytes = 65_536
     static let readyTimeout: TimeInterval = 180
+    static let legacyTelemostProfileID = "tndtun-debug-conference-pilot"
     private static let enabledKey = "recoveryTransports.enabled.v1"
     private static let failedKey = "recoveryTransports.failedRoute.v1"
     private static let dnsFailedKey = "dnsConnection.failedRoute.v1"
@@ -41,11 +42,112 @@ enum RecoveryTransportStore {
     private static func write(_ data: Data, to target: URL?) throws {
         guard data.count <= maximumBytes, let json = String(data: data, encoding: .utf8),
               KindlyTurnRuntime.validateRecovery(configurationJSON: json),
-              var url = target else { throw StorageError.invalid }
+              let url = target else { throw StorageError.invalid }
+        try writeProtected(data, to: url)
+    }
+
+    private static func writeProtected(_ data: Data, to target: URL) throws {
+        var url = target
         try data.write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
         var values = URLResourceValues()
         values.isExcludedFromBackup = true
         try url.setResourceValues(values)
+    }
+
+    struct TelemostInput {
+        let vlessID: UUID
+        let recovery: Data
+
+        static func normalized(_ data: Data, validate: (String) -> Bool = KindlyTurnRuntime.validateRecovery) throws -> Self {
+            guard data.count <= maximumBytes,
+                  let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  Set(root.keys) == ["vless_id", "recovery"],
+                  let rawID = root["vless_id"] as? String,
+                  let recovery = root["recovery"] as? [String: Any] else { throw StorageError.invalid }
+            return try normalized(vlessID: rawID, recovery: recovery, validate: validate)
+        }
+
+        static func normalized(vlessID: String, recovery: Data) throws -> Self {
+            guard recovery.count <= maximumBytes,
+                  let value = try? JSONSerialization.jsonObject(with: recovery) as? [String: Any] else { throw StorageError.invalid }
+            return try normalized(vlessID: vlessID, recovery: value, validate: KindlyTurnRuntime.validateRecovery)
+        }
+
+        private static func normalized(vlessID rawID: String, recovery input: [String: Any],
+                                       validate: (String) -> Bool) throws -> Self {
+            var recovery = input
+            guard let vlessID = UUID(uuidString: rawID.trimmingCharacters(in: .whitespacesAndNewlines)),
+                  let routes = recovery["profiles"] as? [[String: Any]], routes.count == 1,
+                  routes[0]["type"] as? String == "conference",
+                  let conference = routes[0]["conference"] as? [String: Any],
+                  conference["provider"] as? String == "telemost",
+                  let channel = conference["channel"] as? String,
+                  ["vp8channel", "hiddify-kcp"].contains(channel) else { throw StorageError.invalid }
+            // The profile owns its local listener and never inherits route rotation state.
+            recovery["listen"] = "127.0.0.1:9000"
+            recovery.removeValue(forKey: "start_after")
+            let normalized = try JSONSerialization.data(withJSONObject: recovery, options: .sortedKeys)
+            guard validate(String(decoding: normalized, as: UTF8.self)) else { throw StorageError.invalid }
+            return Self(vlessID: vlessID, recovery: normalized)
+        }
+    }
+
+    struct LegacyTelemostStore {
+        let url: URL
+
+        func load() throws -> TelemostInput? {
+            do {
+                return try TelemostInput.normalized(readConfiguration(from: url))
+            } catch let error as CocoaError where error.code == .fileNoSuchFile || error.code == .fileReadNoSuchFile {
+                return nil
+            }
+        }
+
+        func save(_ data: Data) throws -> TelemostInput {
+            let input = try TelemostInput.normalized(data)
+            try writeProtected(data, to: url)
+            return input
+        }
+
+        func remove() throws {
+            if FileManager.default.fileExists(atPath: url.path) {
+                try FileManager.default.removeItem(at: url)
+            }
+        }
+    }
+
+    static func legacyTelemostStore() throws -> LegacyTelemostStore {
+        guard let directory = AppGroup.containerURL else { throw StorageError.missing }
+        return LegacyTelemostStore(url: directory.appendingPathComponent("telemost-profile.json"))
+    }
+
+    private struct ActiveTelemost: Codable {
+        let profileID: String
+        let recovery: Data
+    }
+
+    private static var activeTelemostURL: URL? {
+        AppGroup.containerURL?.appendingPathComponent("active-telemost.json")
+    }
+
+    static func prepareTelemost(profileID: String, recovery: Data?) throws {
+        guard let url = activeTelemostURL else { throw StorageError.missing }
+        if let recovery {
+            let value = try JSONEncoder().encode(ActiveTelemost(profileID: profileID, recovery: recovery))
+            try writeProtected(value, to: url)
+        } else if FileManager.default.fileExists(atPath: url.path) {
+            try FileManager.default.removeItem(at: url)
+        }
+    }
+
+    static func loadTelemost(profileID: String) throws -> Data {
+        guard let url = activeTelemostURL else { throw StorageError.missing }
+        // The envelope includes the base64 encoding of the validated JSON.
+        let data = try Data(contentsOf: url)
+        guard data.count <= maximumBytes * 2 else { throw StorageError.invalid }
+        let staged = try JSONDecoder().decode(ActiveTelemost.self, from: data)
+        guard staged.profileID == profileID else { throw StorageError.missing }
+        return staged.recovery
     }
 
     static func downloadDNS() async throws {

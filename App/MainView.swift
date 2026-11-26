@@ -81,6 +81,19 @@ struct MainView: View {
                 }
                 Spacer()
                 if !store.visibleConfigurations.isEmpty { addButton }
+                if store.mode == .turn {
+                    Button {
+                        var value = SimpleConfiguration()
+                        value.telemostRecovery = Data()
+                        editor = value
+                    } label: {
+                        Image(systemName: "video.badge.plus")
+                            .font(.system(size: 18, weight: .semibold))
+                            .frame(minWidth: 44, minHeight: 44)
+                    }
+                    .accessibilityLabel("Add Telemost profile")
+                    .accessibilityIdentifier("addTelemostProfile")
+                }
             }.padding(.bottom, 14)
 
             if store.visibleConfigurations.isEmpty {
